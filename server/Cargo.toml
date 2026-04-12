@@ -1,9 +1,13 @@
 [package]
 name = "tasked-server"
 description = "HTTP server for the Tasked DAG execution engine"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 license = "MIT"
+
+[[bin]]
+name = "tasked"
+path = "src/main.rs"
 
 [features]
 default = ["journaled"]

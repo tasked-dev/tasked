@@ -39,7 +39,7 @@ use tracing::info;
 
 #[derive(Parser)]
 #[command(
-    name = "tasked-server",
+    name = "tasked",
     about = "HTTP server and CLI for the Tasked DAG execution engine",
     version
 )]

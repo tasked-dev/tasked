@@ -10,7 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY: tasked-server
+  BINARY: tasked
 
 jobs:
   build:
@@ -88,7 +88,7 @@ jobs:
           tag="${GITHUB_REF#refs/tags/}"
           base="https://github.com/tasked-dev/tasked/releases/download/${tag}"
           for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-            url="${base}/tasked-server-${tag}-${target}.tar.gz"
+            url="${base}/tasked-${tag}-${target}.tar.gz"
             sha=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
             echo "${target}=${sha}" >> shas.txt
             echo "${target}: ${sha}"
@@ -111,51 +111,52 @@ jobs:
           x86_64_linux=$(grep x86_64-unknown-linux-gnu shas.txt | cut -d= -f2)
           aarch64_linux=$(grep aarch64-unknown-linux-gnu shas.txt | cut -d= -f2)
 
-          cat > homebrew-tap/Formula/tasked-server.rb <<FORMULA
-          class TaskedServer < Formula
-            desc "HTTP/MCP server for the Tasked DAG execution engine"
+          cat > homebrew-tap/Formula/tasked.rb <<FORMULA
+          class Tasked < Formula
+            desc "DAG task execution engine with durable SQLite storage"
             homepage "https://tasked.dev"
             version "${version}"
             license "MIT"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-server-${tag}-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-${tag}-aarch64-apple-darwin.tar.gz"
                 sha256 "${aarch64_darwin}"
               else
-                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-server-${tag}-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-${tag}-x86_64-apple-darwin.tar.gz"
                 sha256 "${x86_64_darwin}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-server-${tag}-aarch64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-${tag}-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "${aarch64_linux}"
               else
-                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-server-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-${tag}-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "${x86_64_linux}"
               end
             end
 
             def install
-              bin.install "tasked-server"
+              bin.install "tasked"
             end
 
             test do
-              assert_match "tasked-server", shell_output("#{bin}/tasked-server --version")
+              assert_match "tasked", shell_output("#{bin}/tasked --version")
             end
           end
           FORMULA
 
           # Remove leading whitespace from heredoc
-          sed -i 's/^          //' homebrew-tap/Formula/tasked-server.rb
+          sed -i 's/^          //' homebrew-tap/Formula/tasked.rb
 
       - name: Push formula
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/tasked-server.rb
-          git commit -m "Update tasked-server to ${TAG}"
+          git rm -f Formula/tasked-server.rb 2>/dev/null || true
+          git add Formula/tasked.rb
+          git commit -m "Update tasked to ${TAG}"
           git push
