@@ -1,7 +1,7 @@
+use crate::types::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::types::*;
 
 /// Every state-change that must survive a crash.
 /// Applied in sequence to empty MemState, these reproduce correct state.
@@ -93,4 +93,3 @@ pub(crate) struct JournalEntry {
     pub event: JournalEvent,
     pub created_at: DateTime<Utc>,
 }
-

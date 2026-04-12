@@ -266,4 +266,3 @@ pub async fn refresh_token(
 
     Ok((token_resp.access_token, token_resp.expires_in))
 }
-

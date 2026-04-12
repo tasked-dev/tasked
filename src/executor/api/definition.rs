@@ -134,4 +134,3 @@ pub struct ResponseConfig {
     #[serde(default)]
     pub extract: HashMap<String, String>,
 }
-

@@ -157,4 +157,3 @@ fn collect_files(dir: &Path, base: &Path, names: &mut Vec<String>) -> std::io::R
     }
     Ok(())
 }
-

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
 use crate::types::*;
+use chrono::{DateTime, Utc};
 
 use crate::store::StorageError;
 
@@ -165,4 +165,3 @@ impl MemState {
         Ok(())
     }
 }
-

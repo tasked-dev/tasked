@@ -737,4 +737,3 @@ pub(crate) fn read_snapshot_seq(snapshot_path: &Path) -> u64 {
     )
     .unwrap_or(0)
 }
-

@@ -157,4 +157,3 @@ fn value_to_string(value: &Value) -> String {
         other => other.to_string(),
     }
 }
-

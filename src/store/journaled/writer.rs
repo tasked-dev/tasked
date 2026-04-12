@@ -240,4 +240,3 @@ fn event_discriminant(event: &JournalEvent) -> i32 {
         JournalEvent::ScheduleTriggered { .. } => 13,
     }
 }
-

@@ -322,4 +322,3 @@ fn write_meta(conn: &Connection, state: &MemState, journal_seq: u64) -> Result<(
 
     Ok(())
 }
-

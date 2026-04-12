@@ -208,4 +208,3 @@ pub(crate) fn row_to_schedule(row: &rusqlite::Row<'_>) -> Result<Schedule, rusql
         updated_at,
     })
 }
-

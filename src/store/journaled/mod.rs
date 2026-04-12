@@ -1221,4 +1221,3 @@ impl Storage for JournaledStorage {
         self.check_journal_health()
     }
 }
-

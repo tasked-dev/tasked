@@ -101,4 +101,3 @@ impl RateLimiter {
         // If CAS failed, another thread handled the refill — that's fine.
     }
 }
-

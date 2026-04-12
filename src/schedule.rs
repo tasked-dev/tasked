@@ -20,4 +20,3 @@ pub fn compute_next_run(cron_expr: &str, after: DateTime<Utc>) -> Option<DateTim
         .ok()
         .and_then(|s| s.after(&after).next())
 }
-

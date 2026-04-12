@@ -311,4 +311,3 @@ fn extract_port(url: &str) -> Option<u16> {
         host_port.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
     }
 }
-

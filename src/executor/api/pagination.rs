@@ -458,4 +458,3 @@ fn build_paginated_result(status: u16, pages: u32, items: Vec<Value>) -> Execute
         })),
     }
 }
-

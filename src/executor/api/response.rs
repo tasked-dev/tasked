@@ -58,4 +58,3 @@ fn navigate_path(value: &Value, path: &str) -> Option<Value> {
 
     Some(current.clone())
 }
-

@@ -59,4 +59,3 @@ fn fire_inner(url: &str, flow: &Flow) {
 fn fire_inner(url: &str, _flow: &Flow) {
     debug!(url = %url, "webhook skipped (http feature disabled)");
 }
-

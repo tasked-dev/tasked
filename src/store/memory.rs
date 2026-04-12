@@ -604,4 +604,3 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 }
-

@@ -70,4 +70,3 @@ fn resolve_template(template: &str, ctx: &InterpolationContext) -> String {
         other => other.to_string(),
     }
 }
-

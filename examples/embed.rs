@@ -99,4 +99,3 @@ fn default_task_def() -> TaskDef {
         spawn_output: vec![],
     }
 }
-

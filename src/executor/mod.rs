@@ -243,4 +243,3 @@ impl Executor for NoopExecutor {
         ExecuteResult::Success { output: None }
     }
 }
-

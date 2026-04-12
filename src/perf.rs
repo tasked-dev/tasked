@@ -127,4 +127,3 @@ impl CounterSnapshot {
         }
     }
 }
-
