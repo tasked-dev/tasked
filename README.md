@@ -1,6 +1,6 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-# tasked
+# [tasked](https://tasked.dev)
 
 Embeddable DAG task execution engine with durable SQLite storage.
 
@@ -78,7 +78,6 @@ See `examples/embed.rs` for a full working example.
 
 ## Documentation
 
-- [tasked.dev](https://tasked.dev) — project homepage
 - [docs.rs/tasked](https://docs.rs/tasked) — API reference
 
 ## License
