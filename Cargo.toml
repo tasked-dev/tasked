@@ -1,0 +1,54 @@
+[package]
+name = "tasked"
+description = "Embeddable DAG task execution engine with durable SQLite storage"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+authors = ["Brad Dwyer <brad@dwyer.au>"]
+repository = "https://github.com/tasked-dev/tasked"
+homepage = "https://tasked.dev"
+keywords = ["dag", "task", "workflow", "sqlite", "orchestration"]
+categories = ["asynchronous", "development-tools"]
+readme = "README.md"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.16"
+metrics = "0.24"
+petgraph = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+reqwest = { version = "0.13", features = ["json", "form", "query"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "fs", "io-util"] }
+tracing = "0.1"
+rhai = { version = "1", optional = true }
+rand = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.11"
+base64 = "0.22"
+bollard = { version = "0.20", optional = true }
+futures = { version = "0.3", optional = true }
+flate2 = "1"
+tar = "0.4"
+tempfile = { version = "3", optional = true }
+parking_lot = { version = "0.12", optional = true }
+bincode = { version = "1", optional = true }
+crc32fast = { version = "1", optional = true }
+
+[features]
+default = ["sqlite", "http", "shell", "scripting"]
+sqlite = ["dep:rusqlite"]
+http = ["dep:reqwest"]
+shell = []
+scripting = ["dep:rhai"]
+docker = ["dep:bollard", "dep:futures"]
+journaled = ["dep:parking_lot", "dep:bincode", "dep:crc32fast", "sqlite"]
+test-utils = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
