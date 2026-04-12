@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY: tasked-server
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p tasked-server
+
+      - name: Package
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          archive="${BINARY}-${tag}-${{ matrix.target }}"
+          mkdir "$archive"
+          cp "target/${{ matrix.target }}/release/$BINARY" "$archive/"
+          cp LICENSE README.md "$archive/"
+          tar czf "${archive}.tar.gz" "$archive"
+          echo "ARCHIVE=${archive}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: '*.tar.gz'
+
+  homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute SHA256 sums
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          base="https://github.com/tasked-dev/tasked/releases/download/${tag}"
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            url="${base}/tasked-server-${tag}-${target}.tar.gz"
+            sha=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
+            echo "${target}=${sha}" >> shas.txt
+            echo "${target}: ${sha}"
+          done
+          echo "TAG=${tag}" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v4
+        with:
+          repository: tasked-dev/homebrew-tasked
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          tag="$TAG"
+          version="${tag#v}"
+
+          aarch64_darwin=$(grep aarch64-apple-darwin shas.txt | cut -d= -f2)
+          x86_64_darwin=$(grep x86_64-apple-darwin shas.txt | cut -d= -f2)
+          x86_64_linux=$(grep x86_64-unknown-linux-gnu shas.txt | cut -d= -f2)
+          aarch64_linux=$(grep aarch64-unknown-linux-gnu shas.txt | cut -d= -f2)
+
+          cat > homebrew-tap/Formula/tasked-server.rb <<FORMULA
+          class TaskedServer < Formula
+            desc "HTTP/MCP server for the Tasked DAG execution engine"
+            homepage "https://tasked.dev"
+            version "${version}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-server-${tag}-aarch64-apple-darwin.tar.gz"
+                sha256 "${aarch64_darwin}"
+              else
+                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-server-${tag}-x86_64-apple-darwin.tar.gz"
+                sha256 "${x86_64_darwin}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-server-${tag}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${aarch64_linux}"
+              else
+                url "https://github.com/tasked-dev/tasked/releases/download/${tag}/tasked-server-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${x86_64_linux}"
+              end
+            end
+
+            def install
+              bin.install "tasked-server"
+            end
+
+            test do
+              assert_match "tasked-server", shell_output("#{bin}/tasked-server --version")
+            end
+          end
+          FORMULA
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' homebrew-tap/Formula/tasked-server.rb
+
+      - name: Push formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/tasked-server.rb
+          git commit -m "Update tasked-server to ${TAG}"
+          git push

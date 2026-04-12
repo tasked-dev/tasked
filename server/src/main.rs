@@ -40,7 +40,8 @@ use tracing::info;
 #[derive(Parser)]
 #[command(
     name = "tasked-server",
-    about = "HTTP server and CLI for the Tasked DAG execution engine"
+    about = "HTTP server and CLI for the Tasked DAG execution engine",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
