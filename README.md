@@ -14,7 +14,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 # Full feature set (SQLite + shell + HTTP executors + scripting)
-tasked = "0.0.1"
+tasked = "0.0.3"
 
 # Minimal — in-memory storage, callback executors only
 tasked = { version = "0.0.1", default-features = false }
