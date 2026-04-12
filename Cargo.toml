@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "server", "client"]
+resolver = "2"
+
 [package]
 name = "tasked"
 description = "Embeddable DAG task execution engine with durable SQLite storage"
