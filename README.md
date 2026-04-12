@@ -17,10 +17,10 @@ Add to your `Cargo.toml`:
 tasked = "0.0.3"
 
 # Minimal — in-memory storage, callback executors only
-tasked = { version = "0.0.1", default-features = false }
+tasked = { version = "0.0.3", default-features = false }
 
 # Pick features as needed
-tasked = { version = "0.0.1", default-features = false, features = ["sqlite", "shell"] }
+tasked = { version = "0.0.3", default-features = false, features = ["sqlite", "shell"] }
 ```
 
 ### Feature flags
