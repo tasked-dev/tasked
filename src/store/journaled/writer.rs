@@ -1,21 +1,27 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use rusqlite::Connection;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::events::{JournalEntry, JournalEvent};
 use super::snapshot;
 use super::state::MemState;
 
+/// Journal writer. Performs synchronous SQLite commits (fsyncs), so it runs
+/// on a dedicated OS thread (see `JournaledStorage::open`); the unbounded
+/// tokio channel is the boundary between async producers and this thread.
 pub(crate) struct JournalWriter {
-    rx: mpsc::Receiver<JournalEntry>,
+    rx: mpsc::UnboundedReceiver<JournalEntry>,
     conn: Connection,
     config: WriterConfig,
-    flush_watermark: Arc<AtomicU64>,
+    /// Watermark of the last fsync'd sequence, published after each batch.
+    /// emit_durable waiters observe this; dropping the sender on exit wakes
+    /// them so they can fail instead of hanging.
+    watermark_tx: watch::Sender<u64>,
     dead_flag: Arc<AtomicBool>,
     state: Arc<RwLock<MemState>>,
     snapshot_path: Option<PathBuf>,
@@ -25,7 +31,6 @@ pub(crate) struct JournalWriter {
 }
 
 pub(crate) struct WriterConfig {
-    pub flush_interval: Duration,
     pub max_batch_size: usize,
     pub snapshot_interval: u64,
     pub snapshot_time_interval: Duration,
@@ -33,10 +38,10 @@ pub(crate) struct WriterConfig {
 
 impl JournalWriter {
     pub fn new(
-        rx: mpsc::Receiver<JournalEntry>,
+        rx: mpsc::UnboundedReceiver<JournalEntry>,
         journal_path: &PathBuf,
         config: WriterConfig,
-        flush_watermark: Arc<AtomicU64>,
+        watermark_tx: watch::Sender<u64>,
         dead_flag: Arc<AtomicBool>,
         state: Arc<RwLock<MemState>>,
         snapshot_path: Option<PathBuf>,
@@ -63,7 +68,7 @@ impl JournalWriter {
             rx,
             conn,
             config,
-            flush_watermark,
+            watermark_tx,
             dead_flag,
             state,
             snapshot_path,
@@ -73,17 +78,17 @@ impl JournalWriter {
         })
     }
 
-    /// Main writer loop. Runs until the channel is closed.
-    pub async fn run(mut self) {
+    /// Main writer loop. Runs on a dedicated OS thread until the channel is
+    /// closed (all senders dropped) and drained.
+    pub fn run(mut self) {
         let mut batch = Vec::with_capacity(self.config.max_batch_size);
         loop {
             batch.clear();
 
-            // Wait for at least one entry (or channel close)
-            match tokio::time::timeout(self.config.flush_interval, self.rx.recv()).await {
-                Ok(Some(entry)) => batch.push(entry),
-                Ok(None) => break,  // channel closed
-                Err(_) => continue, // timeout, no entries
+            // Block for at least one entry (or channel close).
+            match self.rx.blocking_recv() {
+                Some(entry) => batch.push(entry),
+                None => break, // channel closed and drained
             }
 
             // Drain up to max_batch_size more without waiting
@@ -101,9 +106,9 @@ impl JournalWriter {
                 break;
             }
 
-            // Update watermark
+            // Publish the new durable watermark (wakes emit_durable waiters)
             if let Some(last) = batch.last() {
-                self.flush_watermark.store(last.seq, Ordering::Release);
+                let _ = self.watermark_tx.send(last.seq);
             }
 
             metrics::histogram!("tasked_journal_write_batch_size").record(batch.len() as f64);
@@ -123,6 +128,8 @@ impl JournalWriter {
                 }
             }
         }
+        // Dropping self drops watermark_tx, which wakes any emit_durable
+        // waiters so they can observe journal_dead / channel closure.
     }
 
     /// Write a batch with retry on transient errors.
@@ -170,8 +177,11 @@ impl JournalWriter {
                 "INSERT INTO journal (seq, event_type, payload, crc32, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for entry in batch {
-                let payload =
-                    serde_json::to_vec(&entry.event).expect("JSON serialization should not fail");
+                // Serialization failure is surfaced like any other write
+                // failure (retried, then marks the journal dead) instead of
+                // panicking the writer thread.
+                let payload = serde_json::to_vec(&entry.event)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 let crc = crc32fast::hash(&payload);
                 let event_type = event_discriminant(&entry.event);
                 stmt.execute(rusqlite::params![
@@ -197,12 +207,20 @@ impl JournalWriter {
             .as_ref()
             .expect("take_snapshot called without snapshot_path");
 
-        let watermark = self.flush_watermark.load(Ordering::Acquire);
+        // Read the watermark BEFORE cloning the state. Every event with
+        // seq <= watermark was applied to memory inside the same critical
+        // section that enqueued it (emit_locked), and was then fsync'd, so
+        // the clone taken below is guaranteed to contain all of them. The
+        // snapshot may additionally contain newer (not yet flushed)
+        // mutations whose journal entries survive compaction; replay of
+        // those entries is idempotent.
+        let watermark = *self.watermark_tx.borrow();
 
-        // Take a read lock on state for the duration of the snapshot write
-        let state_guard = self.state.read();
-        snapshot::write_snapshot(&state_guard, snapshot_path, watermark)?;
-        drop(state_guard);
+        // Clone state under the read lock, then release it before the
+        // (potentially slow) serialization + fsync so writers are not
+        // blocked for the duration of the snapshot.
+        let state_clone = { self.state.read().clone() };
+        snapshot::write_snapshot(&state_clone, snapshot_path, watermark)?;
 
         // Compact journal: delete entries up to the snapshot watermark
         self.conn
@@ -211,6 +229,13 @@ impl JournalWriter {
                 rusqlite::params![watermark as i64],
             )
             .map_err(|e| crate::store::StorageError::Internal(format!("journal compact: {e}")))?;
+
+        // Checkpoint + truncate the WAL so the journal file actually shrinks.
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| {
+                crate::store::StorageError::Internal(format!("journal checkpoint: {e}"))
+            })?;
 
         tracing::info!(
             watermark = watermark,

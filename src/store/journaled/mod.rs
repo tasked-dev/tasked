@@ -9,28 +9,42 @@ use super::{Storage, StorageError};
 use crate::types::*;
 use async_trait::async_trait;
 use chrono::Utc;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use config::JournalConfig;
 use events::{JournalEntry, JournalEvent};
 use state::MemState;
 use writer::{JournalWriter, WriterConfig};
 
+/// How long shutdown/Drop waits for the writer thread to drain and exit.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Journaled storage engine.
 ///
 /// All state lives in a `parking_lot::RwLock<MemState>` for lock-free reads.
 /// When `journal_path` is configured, state-change events are sent to a
-/// background writer thread that batch-writes them to a SQLite WAL journal.
+/// dedicated background writer thread that batch-writes them to a SQLite WAL
+/// journal.
+///
+/// Ordering invariant: the journal sequence number is allocated and the event
+/// is enqueued to the writer channel *while the state write lock is held*
+/// (see [`Self::emit_locked`]), so journal replay order always equals the
+/// order in which mutations were applied to memory.
 pub struct JournaledStorage {
     state: Arc<RwLock<MemState>>,
-    journal_tx: Option<tokio::sync::mpsc::Sender<JournalEntry>>,
-    writer_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Sender to the writer thread. `None` in memory-only mode or after
+    /// shutdown. RwLock so `shutdown(&self)` can take it with interior
+    /// mutability while the hot path only needs a read lock.
+    journal_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<JournalEntry>>>,
+    writer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     next_seq: AtomicU64,
-    #[allow(dead_code)]
-    flush_watermark: Arc<AtomicU64>,
+    /// Watermark of the last fsync'd journal sequence, published by the
+    /// writer after each committed batch. Used by emit_durable waits.
+    watermark_rx: Option<tokio::sync::watch::Receiver<u64>>,
     journal_dead: Arc<AtomicBool>,
     #[allow(dead_code)]
     config: JournalConfig,
@@ -46,10 +60,10 @@ impl JournaledStorage {
     pub fn with_config(config: JournalConfig) -> Self {
         Self {
             state: Arc::new(RwLock::new(MemState::new())),
-            journal_tx: None,
-            writer_handle: None,
+            journal_tx: RwLock::new(None),
+            writer_handle: Mutex::new(None),
             next_seq: AtomicU64::new(1),
-            flush_watermark: Arc::new(AtomicU64::new(0)),
+            watermark_rx: None,
             journal_dead: Arc::new(AtomicBool::new(false)),
             config,
         }
@@ -58,11 +72,10 @@ impl JournaledStorage {
     /// Open journaled storage with optional durability.
     ///
     /// If `config.journal_path` is `Some`, runs recovery (loading any existing
-    /// snapshot and replaying the journal), then spawns a background writer
-    /// thread that batch-flushes events to a SQLite WAL journal. If `None`,
-    /// operates in memory-only mode (identical to `new()`).
+    /// snapshot and replaying the journal), then spawns a dedicated OS thread
+    /// that batch-flushes events to a SQLite WAL journal. If `None`, operates
+    /// in memory-only mode (identical to `new()`).
     pub fn open(config: JournalConfig) -> Result<Self, StorageError> {
-        let flush_watermark = Arc::new(AtomicU64::new(0));
         let journal_dead = Arc::new(AtomicBool::new(false));
 
         // Determine snapshot path: explicit or derived from journal path
@@ -90,10 +103,11 @@ impl JournaledStorage {
 
         let state = Arc::new(RwLock::new(recovered_state));
 
-        let (journal_tx, writer_handle) = if let Some(ref path) = config.journal_path {
-            let (tx, rx) = tokio::sync::mpsc::channel(config.channel_capacity);
+        let (journal_tx, writer_handle, watermark_rx) = if let Some(ref path) = config.journal_path
+        {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (watermark_tx, watermark_rx) = tokio::sync::watch::channel(0u64);
             let writer_config = WriterConfig {
-                flush_interval: config.flush_interval,
                 max_batch_size: config.max_batch_size,
                 snapshot_interval: config.snapshot_interval,
                 snapshot_time_interval: config.snapshot_time_interval,
@@ -102,25 +116,32 @@ impl JournaledStorage {
                 rx,
                 path,
                 writer_config,
-                Arc::clone(&flush_watermark),
+                watermark_tx,
                 Arc::clone(&journal_dead),
                 Arc::clone(&state),
                 snapshot_path,
             )
             .map_err(|e| StorageError::Internal(format!("failed to open journal: {e}")))?;
 
-            let handle = tokio::spawn(writer.run());
-            (Some(tx), Some(handle))
+            // The writer performs synchronous SQLite commits (fsyncs), so it
+            // runs on its own OS thread; the channel is the async boundary.
+            let handle = std::thread::Builder::new()
+                .name("tasked-journal-writer".into())
+                .spawn(move || writer.run())
+                .map_err(|e| {
+                    StorageError::Internal(format!("failed to spawn journal writer: {e}"))
+                })?;
+            (Some(tx), Some(handle), Some(watermark_rx))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         Ok(Self {
             state,
-            journal_tx,
-            writer_handle,
+            journal_tx: RwLock::new(journal_tx),
+            writer_handle: Mutex::new(writer_handle),
             next_seq: AtomicU64::new(next_seq),
-            flush_watermark,
+            watermark_rx,
             journal_dead,
             config,
         })
@@ -136,53 +157,130 @@ impl JournaledStorage {
         Ok(())
     }
 
-    /// Send an event to the journal writer. No-op if in memory-only mode.
-    async fn emit(&self, event: JournalEvent) {
-        if let Some(tx) = &self.journal_tx {
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            let entry = JournalEntry {
-                seq,
-                event,
-                created_at: chrono::Utc::now(),
-            };
-            if tx.send(entry).await.is_err() {
-                self.journal_dead.store(true, Ordering::Release);
-            }
+    /// Fail fast before mutating: once the journal writer has died, accepting
+    /// writes would silently lose them (memory would change but nothing would
+    /// be journaled).
+    fn ensure_journal_alive(&self) -> Result<(), StorageError> {
+        if self.journal_dead.load(Ordering::Acquire) {
+            return Err(StorageError::Internal(
+                "journal writer thread has died; rejecting write".into(),
+            ));
         }
+        Ok(())
     }
 
-    /// Send an event and wait until it is durably flushed to SQLite.
+    /// Allocate a sequence number and enqueue the event to the writer.
+    ///
+    /// MUST be called while the state write lock is held (the `_state`
+    /// parameter exists to enforce this at call sites): this guarantees that
+    /// the journal order equals the order mutations were applied, and that
+    /// the flush watermark never claims durability for an event whose
+    /// mutation is not yet visible.
+    ///
+    /// Returns the allocated sequence number, or `None` in memory-only mode.
+    fn emit_locked(
+        &self,
+        _state: &MemState,
+        event: JournalEvent,
+    ) -> Result<Option<u64>, StorageError> {
+        let tx_guard = self.journal_tx.read();
+        let Some(tx) = tx_guard.as_ref() else {
+            return Ok(None);
+        };
+        if self.journal_dead.load(Ordering::Acquire) {
+            return Err(StorageError::Internal(
+                "journal writer thread has died; rejecting write".into(),
+            ));
+        }
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let entry = JournalEntry {
+            seq,
+            event,
+            created_at: chrono::Utc::now(),
+        };
+        if tx.send(entry).is_err() {
+            self.journal_dead.store(true, Ordering::Release);
+            return Err(StorageError::Internal(
+                "journal writer thread has died; write not journaled".into(),
+            ));
+        }
+        Ok(Some(seq))
+    }
+
+    /// Wait until the writer has fsync'd past `seq`.
+    ///
     /// Used for operations where the caller needs a durability guarantee
-    /// before returning (e.g., flow submission — HTTP 200 means persisted).
-    async fn emit_durable(&self, event: JournalEvent) {
-        if let Some(tx) = &self.journal_tx {
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            let entry = JournalEntry {
-                seq,
-                event,
-                created_at: chrono::Utc::now(),
-            };
-            if tx.send(entry).await.is_err() {
-                self.journal_dead.store(true, Ordering::Release);
-                return;
+    /// before returning (e.g. flow submission — HTTP 200 means persisted).
+    /// Returns an error instead of hanging if the writer dies.
+    async fn wait_durable(&self, seq: Option<u64>) -> Result<(), StorageError> {
+        let Some(seq) = seq else { return Ok(()) };
+        let Some(rx) = &self.watermark_rx else {
+            return Ok(());
+        };
+        let mut rx = rx.clone();
+        loop {
+            if *rx.borrow() >= seq {
+                return Ok(());
             }
-            // Poll until the writer has flushed past our sequence number.
-            // The writer updates flush_watermark after each batch commit + fsync.
-            while self.flush_watermark.load(Ordering::Acquire) < seq {
-                tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+            if self.journal_dead.load(Ordering::Acquire) {
+                return Err(StorageError::Internal(
+                    "journal writer died before the write was made durable".into(),
+                ));
+            }
+            // The writer publishes the watermark after each fsync'd batch and
+            // drops the sender when it exits, so this cannot hang forever.
+            if rx.changed().await.is_err() {
+                if *rx.borrow() >= seq {
+                    return Ok(());
+                }
+                return Err(StorageError::Internal(
+                    "journal writer died before the write was made durable".into(),
+                ));
             }
         }
     }
 
-    /// Graceful shutdown: drop the channel sender so the writer drains remaining
-    /// entries and exits, then wait for the writer task to finish.
-    pub async fn shutdown(&mut self) {
-        // Drop sender to signal writer to finish draining
-        self.journal_tx.take();
-        // Wait for writer to flush remaining entries and exit
-        if let Some(handle) = self.writer_handle.take() {
-            let _ = handle.await;
+    /// Graceful shutdown: drop the channel sender so the writer drains
+    /// remaining entries and exits, then wait (bounded) for the writer
+    /// thread to finish.
+    pub async fn shutdown(&self) {
+        // Drop sender to signal the writer to finish draining.
+        drop(self.journal_tx.write().take());
+        let handle = self.writer_handle.lock().take();
+        if let Some(handle) = handle {
+            let deadline = std::time::Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                tracing::warn!("journal writer did not exit within shutdown timeout; detaching");
+            }
         }
+    }
+
+    /// Synchronous best-effort shutdown used by Drop.
+    fn shutdown_blocking(&self) {
+        drop(self.journal_tx.write().take());
+        let handle = self.writer_handle.lock().take();
+        if let Some(handle) = handle {
+            let deadline = std::time::Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                tracing::warn!("journal writer did not exit within drop timeout; detaching");
+            }
+        }
+    }
+}
+
+impl Drop for JournaledStorage {
+    fn drop(&mut self) {
+        self.shutdown_blocking();
     }
 }
 
@@ -197,18 +295,24 @@ impl Storage for JournaledStorage {
     // ---- Queue CRUD ----
 
     async fn create_queue(&self, queue: &Queue) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
+        let seq;
         {
             let mut state = self.state.write();
             if state.queues.contains_key(&queue.id) {
                 return Err(StorageError::QueueAlreadyExists(queue.id.to_string()));
             }
             state.queues.insert(queue.id.clone(), queue.clone());
+            seq = self.emit_locked(
+                &state,
+                JournalEvent::QueueCreated {
+                    queue: queue.clone(),
+                },
+            )?;
         }
-        self.emit(JournalEvent::QueueCreated {
-            queue: queue.clone(),
-        })
-        .await;
-        Ok(())
+        // Queue creation is rare and structural: make it durable like
+        // create_flow so an acknowledged queue survives a crash.
+        self.wait_durable(seq).await
     }
 
     async fn get_queue(&self, id: &QueueId) -> Result<Option<Queue>, StorageError> {
@@ -222,17 +326,20 @@ impl Storage for JournaledStorage {
     }
 
     async fn delete_queue(&self, id: &QueueId) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             // Cascade: delete the queue's flows, tasks, deps, and schedules,
             // maintaining secondary indexes. Replay of QueueDeleted performs
             // the same cascade so recovery matches.
             state.remove_queue_cascade(id);
+            self.emit_locked(
+                &state,
+                JournalEvent::QueueDeleted {
+                    queue_id: id.clone(),
+                },
+            )?;
         }
-        self.emit(JournalEvent::QueueDeleted {
-            queue_id: id.clone(),
-        })
-        .await;
         Ok(())
     }
 
@@ -244,6 +351,8 @@ impl Storage for JournaledStorage {
         tasks: &[Task],
         deps: &HashMap<TaskId, Vec<TaskId>>,
     ) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
+        let seq;
         {
             let mut state = self.state.write();
             if state.flows.contains_key(&flow.id) {
@@ -275,16 +384,19 @@ impl Storage for JournaledStorage {
                         .push(task_id.clone());
                 }
             }
+
+            seq = self.emit_locked(
+                &state,
+                JournalEvent::FlowCreated {
+                    flow: flow.clone(),
+                    tasks: tasks.to_vec(),
+                    deps: deps.clone(),
+                },
+            )?;
         }
         // Durable emit: wait for journal flush before returning.
         // This guarantees that an HTTP 200 means the flow is persisted.
-        self.emit_durable(JournalEvent::FlowCreated {
-            flow: flow.clone(),
-            tasks: tasks.to_vec(),
-            deps: deps.clone(),
-        })
-        .await;
-        Ok(())
+        self.wait_durable(seq).await
     }
 
     async fn get_flow(&self, id: &FlowId) -> Result<Option<Flow>, StorageError> {
@@ -311,7 +423,7 @@ impl Storage for JournaledStorage {
         id: &FlowId,
         new_state: FlowState,
     ) -> Result<(), StorageError> {
-        let updated_at;
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             let flow = state
@@ -320,14 +432,16 @@ impl Storage for JournaledStorage {
                 .ok_or_else(|| StorageError::FlowNotFound(id.to_string()))?;
             flow.state = new_state;
             flow.updated_at = Utc::now();
-            updated_at = flow.updated_at;
+            let updated_at = flow.updated_at;
+            self.emit_locked(
+                &state,
+                JournalEvent::FlowStateChanged {
+                    flow_id: id.clone(),
+                    new_state,
+                    updated_at,
+                },
+            )?;
         }
-        self.emit(JournalEvent::FlowStateChanged {
-            flow_id: id.clone(),
-            new_state,
-            updated_at,
-        })
-        .await;
         Ok(())
     }
 
@@ -339,6 +453,8 @@ impl Storage for JournaledStorage {
         // increment_flow_counter is always called right after a
         // complete_task_with_ready (which already emits TaskCompleted with
         // the succeeded flag), so we do NOT emit a separate event here.
+        // Recovery additionally recomputes counters from task states.
+        self.ensure_journal_alive()?;
         let mut state = self.state.write();
         let flow = state
             .flows
@@ -465,20 +581,23 @@ impl Storage for JournaledStorage {
         flow_id: &FlowId,
         new_state: TaskState,
     ) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             let key = (task_id.clone(), flow_id.clone());
             state.transition_task_state(&key, new_state)?;
+            self.emit_locked(
+                &state,
+                JournalEvent::TaskStateChanged {
+                    task_id: task_id.clone(),
+                    flow_id: flow_id.clone(),
+                    new_state,
+                    retry_at: None,
+                    started_at: None,
+                    retries_remaining: None,
+                },
+            )?;
         }
-        self.emit(JournalEvent::TaskStateChanged {
-            task_id: task_id.clone(),
-            flow_id: flow_id.clone(),
-            new_state,
-            retry_at: None,
-            started_at: None,
-            retries_remaining: None,
-        })
-        .await;
         Ok(())
     }
 
@@ -487,7 +606,7 @@ impl Storage for JournaledStorage {
         task_id: &TaskId,
         flow_id: &FlowId,
     ) -> Result<(), StorageError> {
-        let started_at;
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             let key = (task_id.clone(), flow_id.clone());
@@ -509,20 +628,23 @@ impl Storage for JournaledStorage {
             let task = state.tasks.get_mut(&key).expect("checked above");
             task.state = TaskState::Running;
             task.started_at = Some(Utc::now());
-            started_at = task.started_at;
+            let started_at = task.started_at;
 
             let new_snapshot = task.clone();
             state.index_add(&new_snapshot);
+
+            self.emit_locked(
+                &state,
+                JournalEvent::TaskStateChanged {
+                    task_id: task_id.clone(),
+                    flow_id: flow_id.clone(),
+                    new_state: TaskState::Running,
+                    retry_at: None,
+                    started_at,
+                    retries_remaining: None,
+                },
+            )?;
         }
-        self.emit(JournalEvent::TaskStateChanged {
-            task_id: task_id.clone(),
-            flow_id: flow_id.clone(),
-            new_state: TaskState::Running,
-            retry_at: None,
-            started_at,
-            retries_remaining: None,
-        })
-        .await;
         Ok(())
     }
 
@@ -530,8 +652,9 @@ impl Storage for JournaledStorage {
         &self,
         tasks: &[(&TaskId, &FlowId)],
     ) -> Result<Vec<(TaskId, FlowId)>, StorageError> {
-        let succeeded;
+        self.ensure_journal_alive()?;
         let now = Utc::now();
+        let succeeded;
         {
             let mut state = self.state.write();
             let mut batch_succeeded = Vec::with_capacity(tasks.len());
@@ -555,21 +678,21 @@ impl Storage for JournaledStorage {
                 let new_snapshot = task.clone();
                 state.index_add(&new_snapshot);
 
+                self.emit_locked(
+                    &state,
+                    JournalEvent::TaskStateChanged {
+                        task_id: task_id.clone(),
+                        flow_id: flow_id.clone(),
+                        new_state: TaskState::Running,
+                        retry_at: None,
+                        started_at: Some(now),
+                        retries_remaining: None,
+                    },
+                )?;
+
                 batch_succeeded.push((task_id.clone(), flow_id.clone()));
             }
             succeeded = batch_succeeded;
-        }
-        // Emit individual events for each successfully transitioned task
-        for (task_id, flow_id) in &succeeded {
-            self.emit(JournalEvent::TaskStateChanged {
-                task_id: task_id.clone(),
-                flow_id: flow_id.clone(),
-                new_state: TaskState::Running,
-                retry_at: None,
-                started_at: Some(now),
-                retries_remaining: None,
-            })
-            .await;
         }
         Ok(succeeded)
     }
@@ -580,6 +703,7 @@ impl Storage for JournaledStorage {
         flow_id: &FlowId,
         output: serde_json::Value,
     ) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             let key = (task_id.clone(), flow_id.clone());
@@ -587,13 +711,15 @@ impl Storage for JournaledStorage {
                 StorageError::TaskNotFound(task_id.to_string(), flow_id.to_string())
             })?;
             task.output = Some(output.clone());
+            self.emit_locked(
+                &state,
+                JournalEvent::TaskOutputSet {
+                    task_id: task_id.clone(),
+                    flow_id: flow_id.clone(),
+                    output,
+                },
+            )?;
         }
-        self.emit(JournalEvent::TaskOutputSet {
-            task_id: task_id.clone(),
-            flow_id: flow_id.clone(),
-            output,
-        })
-        .await;
         Ok(())
     }
 
@@ -603,7 +729,7 @@ impl Storage for JournaledStorage {
         flow_id: &FlowId,
         output: Option<serde_json::Value>,
     ) -> Result<(), StorageError> {
-        let completed_at;
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             let key = (task_id.clone(), flow_id.clone());
@@ -626,19 +752,22 @@ impl Storage for JournaledStorage {
             task.state = TaskState::Succeeded;
             task.output = output.clone();
             task.completed_at = Some(Utc::now());
-            completed_at = task.completed_at.unwrap();
+            let completed_at = task.completed_at.unwrap();
+
+            self.emit_locked(
+                &state,
+                JournalEvent::TaskCompleted {
+                    task_id: task_id.clone(),
+                    flow_id: flow_id.clone(),
+                    new_state: TaskState::Succeeded,
+                    output,
+                    error: None,
+                    completed_at,
+                    succeeded: true,
+                    newly_ready: vec![],
+                },
+            )?;
         }
-        self.emit(JournalEvent::TaskCompleted {
-            task_id: task_id.clone(),
-            flow_id: flow_id.clone(),
-            new_state: TaskState::Succeeded,
-            output,
-            error: None,
-            completed_at,
-            succeeded: true,
-            newly_ready: vec![],
-        })
-        .await;
         Ok(())
     }
 
@@ -648,7 +777,7 @@ impl Storage for JournaledStorage {
         flow_id: &FlowId,
         error: &str,
     ) -> Result<(), StorageError> {
-        let completed_at;
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             let key = (task_id.clone(), flow_id.clone());
@@ -671,19 +800,22 @@ impl Storage for JournaledStorage {
             task.state = TaskState::Failed;
             task.error = Some(error.to_string());
             task.completed_at = Some(Utc::now());
-            completed_at = task.completed_at.unwrap();
+            let completed_at = task.completed_at.unwrap();
+
+            self.emit_locked(
+                &state,
+                JournalEvent::TaskCompleted {
+                    task_id: task_id.clone(),
+                    flow_id: flow_id.clone(),
+                    new_state: TaskState::Failed,
+                    output: None,
+                    error: Some(error.to_string()),
+                    completed_at,
+                    succeeded: false,
+                    newly_ready: vec![],
+                },
+            )?;
         }
-        self.emit(JournalEvent::TaskCompleted {
-            task_id: task_id.clone(),
-            flow_id: flow_id.clone(),
-            new_state: TaskState::Failed,
-            output: None,
-            error: Some(error.to_string()),
-            completed_at,
-            succeeded: false,
-            newly_ready: vec![],
-        })
-        .await;
         Ok(())
     }
 
@@ -693,7 +825,7 @@ impl Storage for JournaledStorage {
         flow_id: &FlowId,
         retry_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StorageError> {
-        let retries_remaining;
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             let key = (task_id.clone(), flow_id.clone());
@@ -717,20 +849,23 @@ impl Storage for JournaledStorage {
             task.retry_at = Some(retry_at);
             task.retries_remaining = task.retries_remaining.saturating_sub(1);
             task.started_at = None;
-            retries_remaining = task.retries_remaining;
+            let retries_remaining = task.retries_remaining;
 
             let new_snapshot = task.clone();
             state.index_add(&new_snapshot);
+
+            self.emit_locked(
+                &state,
+                JournalEvent::TaskStateChanged {
+                    task_id: task_id.clone(),
+                    flow_id: flow_id.clone(),
+                    new_state: TaskState::Delayed,
+                    retry_at: Some(retry_at),
+                    started_at: None,
+                    retries_remaining: Some(retries_remaining),
+                },
+            )?;
         }
-        self.emit(JournalEvent::TaskStateChanged {
-            task_id: task_id.clone(),
-            flow_id: flow_id.clone(),
-            new_state: TaskState::Delayed,
-            retry_at: Some(retry_at),
-            started_at: None,
-            retries_remaining: Some(retries_remaining),
-        })
-        .await;
         Ok(())
     }
 
@@ -777,6 +912,7 @@ impl Storage for JournaledStorage {
     }
 
     async fn resolve_ready_tasks(&self, flow_id: &FlowId) -> Result<Vec<TaskId>, StorageError> {
+        self.ensure_journal_alive()?;
         let newly_ready;
         {
             let mut state = self.state.write();
@@ -811,23 +947,22 @@ impl Storage for JournaledStorage {
                         task.state = TaskState::Ready;
                         let snapshot = task.clone();
                         state.index_add(&snapshot);
+                        self.emit_locked(
+                            &state,
+                            JournalEvent::TaskStateChanged {
+                                task_id: task_id.clone(),
+                                flow_id: flow_id.clone(),
+                                new_state: TaskState::Ready,
+                                retry_at: None,
+                                started_at: None,
+                                retries_remaining: None,
+                            },
+                        )?;
                         ready.push(task_id);
                     }
                 }
             }
             newly_ready = ready;
-        }
-        // Emit individual TaskStateChanged for each newly-ready task
-        for task_id in &newly_ready {
-            self.emit(JournalEvent::TaskStateChanged {
-                task_id: task_id.clone(),
-                flow_id: flow_id.clone(),
-                new_state: TaskState::Ready,
-                retry_at: None,
-                started_at: None,
-                retries_remaining: None,
-            })
-            .await;
         }
         Ok(newly_ready)
     }
@@ -841,7 +976,8 @@ impl Storage for JournaledStorage {
         output: Option<serde_json::Value>,
         newly_ready: &[TaskId],
     ) -> Result<Flow, StorageError> {
-        let (flow, completed_at);
+        self.ensure_journal_alive()?;
+        let flow;
         {
             let mut state = self.state.write();
             let now = Utc::now();
@@ -868,7 +1004,7 @@ impl Storage for JournaledStorage {
             task.state = TaskState::Succeeded;
             task.output = output.clone();
             task.completed_at = Some(now);
-            completed_at = now;
+            let completed_at = now;
             // Succeeded is not indexed, no index_add
 
             // 2. Increment flow counter
@@ -879,7 +1015,7 @@ impl Storage for JournaledStorage {
             f.tasks_succeeded += 1;
             f.updated_at = now;
 
-            // 3. Promote newly-ready tasks
+            // 3. Promote newly-ready tasks (only those still Pending)
             for tid in newly_ready {
                 let dep_key = (tid.clone(), flow_id.clone());
                 if let Some(dep_task) = state.tasks.get(&dep_key)
@@ -897,18 +1033,21 @@ impl Storage for JournaledStorage {
             }
 
             flow = state.flows.get(flow_id).expect("checked above").clone();
+
+            self.emit_locked(
+                &state,
+                JournalEvent::TaskCompleted {
+                    task_id: task_id.clone(),
+                    flow_id: flow_id.clone(),
+                    new_state: TaskState::Succeeded,
+                    output,
+                    error: None,
+                    completed_at,
+                    succeeded: true,
+                    newly_ready: newly_ready.to_vec(),
+                },
+            )?;
         }
-        self.emit(JournalEvent::TaskCompleted {
-            task_id: task_id.clone(),
-            flow_id: flow_id.clone(),
-            new_state: TaskState::Succeeded,
-            output,
-            error: None,
-            completed_at,
-            succeeded: true,
-            newly_ready: newly_ready.to_vec(),
-        })
-        .await;
         Ok(flow)
     }
 
@@ -916,19 +1055,18 @@ impl Storage for JournaledStorage {
         &self,
         completions: &[(TaskId, FlowId, Option<serde_json::Value>, Vec<TaskId>)],
     ) -> Result<Vec<Option<Flow>>, StorageError> {
+        self.ensure_journal_alive()?;
         let results;
-        let events;
         {
             let mut state = self.state.write();
             let now = Utc::now();
             let mut batch_results = Vec::with_capacity(completions.len());
-            let mut batch_events = Vec::new();
 
             for (task_id, flow_id, output, newly_ready) in completions {
                 let key = (task_id.clone(), flow_id.clone());
 
                 // 1. Mark task succeeded
-                let valid = match state.tasks.get(&key) {
+                match state.tasks.get(&key) {
                     Some(task) => {
                         if !task.state.can_transition_to(TaskState::Succeeded) {
                             batch_results.push(None);
@@ -936,20 +1074,17 @@ impl Storage for JournaledStorage {
                         }
                         let old_snapshot = task.clone();
                         state.index_remove(&old_snapshot);
-                        true
                     }
                     None => {
                         batch_results.push(None);
                         continue;
                     }
-                };
-
-                if valid {
-                    let task = state.tasks.get_mut(&key).expect("checked above");
-                    task.state = TaskState::Succeeded;
-                    task.output = output.clone();
-                    task.completed_at = Some(now);
                 }
+
+                let task = state.tasks.get_mut(&key).expect("checked above");
+                task.state = TaskState::Succeeded;
+                task.output = output.clone();
+                task.completed_at = Some(now);
 
                 // 2. Increment flow counter
                 let flow = match state.flows.get_mut(flow_id) {
@@ -963,7 +1098,7 @@ impl Storage for JournaledStorage {
                     }
                 };
 
-                // 3. Promote newly-ready tasks
+                // 3. Promote newly-ready tasks (only those still Pending)
                 for tid in newly_ready {
                     let dep_key = (tid.clone(), flow_id.clone());
                     if let Some(dep_task) = state.tasks.get(&dep_key)
@@ -980,24 +1115,23 @@ impl Storage for JournaledStorage {
                     }
                 }
 
-                batch_events.push(JournalEvent::TaskCompleted {
-                    task_id: task_id.clone(),
-                    flow_id: flow_id.clone(),
-                    new_state: TaskState::Succeeded,
-                    output: output.clone(),
-                    error: None,
-                    completed_at: now,
-                    succeeded: true,
-                    newly_ready: newly_ready.clone(),
-                });
+                self.emit_locked(
+                    &state,
+                    JournalEvent::TaskCompleted {
+                        task_id: task_id.clone(),
+                        flow_id: flow_id.clone(),
+                        new_state: TaskState::Succeeded,
+                        output: output.clone(),
+                        error: None,
+                        completed_at: now,
+                        succeeded: true,
+                        newly_ready: newly_ready.clone(),
+                    },
+                )?;
 
                 batch_results.push(Some(flow));
             }
             results = batch_results;
-            events = batch_events;
-        }
-        for event in events {
-            self.emit(event).await;
         }
         Ok(results)
     }
@@ -1010,7 +1144,8 @@ impl Storage for JournaledStorage {
         tasks: &[Task],
         deps: &HashMap<TaskId, Vec<TaskId>>,
     ) -> Result<Flow, StorageError> {
-        let (flow, new_task_count);
+        self.ensure_journal_alive()?;
+        let flow;
         {
             let mut state = self.state.write();
 
@@ -1037,7 +1172,7 @@ impl Storage for JournaledStorage {
             }
 
             // Update flow task_count
-            new_task_count = tasks.len();
+            let new_task_count = tasks.len();
             let f = state
                 .flows
                 .get_mut(flow_id)
@@ -1046,14 +1181,17 @@ impl Storage for JournaledStorage {
             f.updated_at = Utc::now();
 
             flow = f.clone();
+
+            self.emit_locked(
+                &state,
+                JournalEvent::TasksInjected {
+                    flow_id: flow_id.clone(),
+                    tasks: tasks.to_vec(),
+                    deps: deps.clone(),
+                    new_task_count,
+                },
+            )?;
         }
-        self.emit(JournalEvent::TasksInjected {
-            flow_id: flow_id.clone(),
-            tasks: tasks.to_vec(),
-            deps: deps.clone(),
-            new_task_count,
-        })
-        .await;
         Ok(flow)
     }
 
@@ -1079,7 +1217,8 @@ impl Storage for JournaledStorage {
         queue_id: &QueueId,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<usize, StorageError> {
-        let (count, flow_ids);
+        self.ensure_journal_alive()?;
+        let count;
         {
             let mut state = self.state.write();
 
@@ -1116,14 +1255,16 @@ impl Storage for JournaledStorage {
                 state.deps.retain(|(_tid, fid), _| fid != flow_id);
                 state.dependents.retain(|(_tid, fid), _| fid != flow_id);
             }
-            flow_ids = to_delete;
-        }
-        if !flow_ids.is_empty() {
-            self.emit(JournalEvent::FlowsDeleted {
-                queue_id: queue_id.clone(),
-                flow_ids,
-            })
-            .await;
+
+            if !to_delete.is_empty() {
+                self.emit_locked(
+                    &state,
+                    JournalEvent::FlowsDeleted {
+                        queue_id: queue_id.clone(),
+                        flow_ids: to_delete,
+                    },
+                )?;
+            }
         }
         Ok(count)
     }
@@ -1131,16 +1272,19 @@ impl Storage for JournaledStorage {
     // ---- Schedules ----
 
     async fn create_schedule(&self, schedule: &Schedule) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             state
                 .schedules
                 .insert(schedule.id.clone(), schedule.clone());
+            self.emit_locked(
+                &state,
+                JournalEvent::ScheduleCreated {
+                    schedule: schedule.clone(),
+                },
+            )?;
         }
-        self.emit(JournalEvent::ScheduleCreated {
-            schedule: schedule.clone(),
-        })
-        .await;
         Ok(())
     }
 
@@ -1162,6 +1306,7 @@ impl Storage for JournaledStorage {
     }
 
     async fn update_schedule(&self, schedule: &Schedule) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             if !state.schedules.contains_key(&schedule.id) {
@@ -1170,23 +1315,28 @@ impl Storage for JournaledStorage {
             state
                 .schedules
                 .insert(schedule.id.clone(), schedule.clone());
+            self.emit_locked(
+                &state,
+                JournalEvent::ScheduleUpdated {
+                    schedule: schedule.clone(),
+                },
+            )?;
         }
-        self.emit(JournalEvent::ScheduleUpdated {
-            schedule: schedule.clone(),
-        })
-        .await;
         Ok(())
     }
 
     async fn delete_schedule(&self, id: &ScheduleId) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             state.schedules.remove(id);
+            self.emit_locked(
+                &state,
+                JournalEvent::ScheduleDeleted {
+                    schedule_id: id.clone(),
+                },
+            )?;
         }
-        self.emit(JournalEvent::ScheduleDeleted {
-            schedule_id: id.clone(),
-        })
-        .await;
         Ok(())
     }
 
@@ -1207,6 +1357,7 @@ impl Storage for JournaledStorage {
         triggered_at: chrono::DateTime<chrono::Utc>,
         next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), StorageError> {
+        self.ensure_journal_alive()?;
         {
             let mut state = self.state.write();
             let schedule = state
@@ -1216,13 +1367,15 @@ impl Storage for JournaledStorage {
             schedule.last_triggered_at = Some(triggered_at);
             schedule.next_run_at = next_run_at;
             schedule.updated_at = Utc::now();
+            self.emit_locked(
+                &state,
+                JournalEvent::ScheduleTriggered {
+                    schedule_id: id.clone(),
+                    triggered_at,
+                    next_run_at,
+                },
+            )?;
         }
-        self.emit(JournalEvent::ScheduleTriggered {
-            schedule_id: id.clone(),
-            triggered_at,
-            next_run_at,
-        })
-        .await;
         Ok(())
     }
 

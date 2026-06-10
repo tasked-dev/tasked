@@ -6,6 +6,10 @@ use chrono::{DateTime, Utc};
 use crate::store::StorageError;
 
 /// In-memory authoritative state for the journaled engine.
+///
+/// `Clone` is used by the snapshot writer to copy the state under a short
+/// read lock and serialize the copy without blocking writers.
+#[derive(Clone)]
 pub(crate) struct MemState {
     pub queues: HashMap<QueueId, Queue>,
     pub flows: HashMap<FlowId, Flow>,

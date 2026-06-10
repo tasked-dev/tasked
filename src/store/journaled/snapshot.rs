@@ -56,6 +56,27 @@ pub(crate) fn write_snapshot(
     std::fs::rename(&tmp_path, snapshot_path)
         .map_err(|e| StorageError::Internal(format!("snapshot rename: {e}")))?;
 
+    // fsync the parent directory so the rename itself is durable BEFORE the
+    // writer deletes the compacted journal rows. Without this, a crash could
+    // lose the directory entry for the new snapshot while the journal rows
+    // it replaced are already gone.
+    if let Some(parent) = snapshot_path.parent() {
+        match std::fs::File::open(parent) {
+            Ok(dir) => {
+                if let Err(e) = dir.sync_all() {
+                    return Err(StorageError::Internal(format!(
+                        "snapshot dir fsync: {e}"
+                    )));
+                }
+            }
+            Err(e) => {
+                return Err(StorageError::Internal(format!(
+                    "snapshot dir open for fsync: {e}"
+                )));
+            }
+        }
+    }
+
     metrics::counter!("tasked_journal_snapshots_total").increment(1);
 
     Ok(())

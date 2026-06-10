@@ -10,9 +10,14 @@ pub struct JournalConfig {
     /// Path to the snapshot SQLite database.
     /// Defaults to `snapshot.db` in the same directory as the journal.
     pub snapshot_path: Option<PathBuf>,
-    /// Bounded channel capacity. Default: 8192.
+    /// Retained for backwards compatibility. The journal channel is now
+    /// unbounded so events can be enqueued while the state lock is held
+    /// (preserving apply order == journal order); the writer's batch size
+    /// and `health_check` failure detection bound the backlog in practice.
     pub channel_capacity: usize,
-    /// Max time before flushing a partial batch. Default: 5ms.
+    /// Retained for backwards compatibility. The writer flushes as soon as
+    /// entries are available (batching opportunistically up to
+    /// `max_batch_size`) rather than waiting a fixed interval.
     pub flush_interval: Duration,
     /// Max entries per flush batch. Default: 512.
     pub max_batch_size: usize,

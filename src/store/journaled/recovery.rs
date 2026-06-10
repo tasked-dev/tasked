@@ -308,50 +308,72 @@ fn replay_journal(
         return Ok(after_seq);
     }
 
-    let mut stmt = conn
-        .prepare("SELECT seq, payload, crc32 FROM journal WHERE seq > ?1 ORDER BY seq ASC")
-        .map_err(|e| StorageError::Internal(format!("journal prepare: {e}")))?;
-
     let mut max_seq = after_seq;
     let mut replayed = 0u64;
+    let mut corrupt_seq: Option<i64> = None;
 
-    let rows = stmt
-        .query_map(rusqlite::params![after_seq as i64], |row| {
-            let seq: i64 = row.get(0)?;
-            let payload: Vec<u8> = row.get(1)?;
-            let crc: i64 = row.get(2)?;
-            Ok((seq, payload, crc))
-        })
-        .map_err(|e| StorageError::Internal(format!("journal query: {e}")))?;
+    {
+        let mut stmt = conn
+            .prepare("SELECT seq, payload, crc32 FROM journal WHERE seq > ?1 ORDER BY seq ASC")
+            .map_err(|e| StorageError::Internal(format!("journal prepare: {e}")))?;
 
-    for row in rows {
-        let (seq, payload, stored_crc) =
-            row.map_err(|e| StorageError::Internal(format!("journal row: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![after_seq as i64], |row| {
+                let seq: i64 = row.get(0)?;
+                let payload: Vec<u8> = row.get(1)?;
+                let crc: i64 = row.get(2)?;
+                Ok((seq, payload, crc))
+            })
+            .map_err(|e| StorageError::Internal(format!("journal query: {e}")))?;
 
-        // Verify CRC32
-        let computed_crc = crc32fast::hash(&payload) as i64;
-        if computed_crc != stored_crc {
-            tracing::warn!(
-                seq = seq,
-                expected_crc = stored_crc,
-                computed_crc = computed_crc,
-                "CRC32 mismatch at seq {seq}, stopping replay (prefix property)"
-            );
-            break;
+        for row in rows {
+            let (seq, payload, stored_crc) =
+                row.map_err(|e| StorageError::Internal(format!("journal row: {e}")))?;
+
+            // Verify CRC32
+            let computed_crc = crc32fast::hash(&payload) as i64;
+            if computed_crc != stored_crc {
+                tracing::warn!(
+                    seq = seq,
+                    expected_crc = stored_crc,
+                    computed_crc = computed_crc,
+                    "CRC32 mismatch at seq {seq}, stopping replay (prefix property)"
+                );
+                corrupt_seq = Some(seq);
+                break;
+            }
+
+            // Deserialize event
+            let event: JournalEvent = serde_json::from_slice(&payload).map_err(|e| {
+                StorageError::Internal(format!(
+                    "journal deserialize seq {seq} (payload len {}): {e}",
+                    payload.len()
+                ))
+            })?;
+
+            apply_event(state, event);
+
+            max_seq = seq as u64;
+            replayed += 1;
         }
+    }
 
-        // Deserialize event
-        let event: JournalEvent = serde_json::from_slice(&payload).map_err(|e| {
-            StorageError::Internal(format!(
-                "journal deserialize seq {seq} (payload len {}): {e}",
-                payload.len()
-            ))
-        })?;
-
-        apply_event(state, event);
-
-        max_seq = seq as u64;
-        replayed += 1;
+    // After a CRC-stop, truncate the journal at the corruption point.
+    // Rows with seq >= the corrupt seq were never applied; leaving them in
+    // place would make the writer's next INSERT collide on the seq PRIMARY
+    // KEY (next_seq restarts at max_seq + 1) and kill the journal.
+    if let Some(corrupt) = corrupt_seq {
+        let deleted = conn
+            .execute(
+                "DELETE FROM journal WHERE seq >= ?1",
+                rusqlite::params![corrupt],
+            )
+            .map_err(|e| StorageError::Internal(format!("journal truncate: {e}")))?;
+        tracing::warn!(
+            truncated_at_seq = corrupt,
+            rows_deleted = deleted,
+            "journal truncated at first CRC mismatch; events at and after this point are lost"
+        );
     }
 
     tracing::info!(
@@ -388,11 +410,15 @@ fn apply_event(state: &mut MemState, event: JournalEvent) {
 
             for (task_id, dep_ids) in deps {
                 for dep_id in &dep_ids {
-                    state
+                    // Dedupe: the snapshot may already contain these edges
+                    // when the event is replayed over a fresher snapshot.
+                    let entry = state
                         .dependents
                         .entry((dep_id.clone(), flow_id.clone()))
-                        .or_default()
-                        .push(task_id.clone());
+                        .or_default();
+                    if !entry.contains(&task_id) {
+                        entry.push(task_id.clone());
+                    }
                 }
                 state.deps.insert((task_id, flow_id.clone()), dep_ids);
             }
@@ -439,14 +465,15 @@ fn apply_event(state: &mut MemState, event: JournalEvent) {
                 }
                 flow.updated_at = completed_at;
             }
-            // Promote newly ready tasks
+            // Promote newly-ready tasks — but only those still Pending,
+            // matching the live path. Promoting unconditionally would
+            // resurrect tasks that were cancelled after this event was
+            // journaled (or that already progressed past Ready).
             for tid in newly_ready {
                 let rkey = (tid, flow_id.clone());
-                if let Some(task) = state.tasks.get(&rkey) {
-                    let snapshot = task.clone();
-                    state.index_remove(&snapshot);
-                }
-                if let Some(task) = state.tasks.get_mut(&rkey) {
+                if let Some(task) = state.tasks.get_mut(&rkey)
+                    && task.state == TaskState::Pending
+                {
                     task.state = TaskState::Ready;
                     let snapshot = task.clone();
                     state.index_add(&snapshot);
@@ -495,28 +522,40 @@ fn apply_event(state: &mut MemState, event: JournalEvent) {
             flow_id,
             tasks,
             deps,
-            new_task_count,
+            new_task_count: _,
         } => {
-            // Insert tasks + indexes
+            // Idempotent replay: the snapshot watermark can lag the flushed
+            // journal, so the snapshot may already contain these tasks.
+            // Skip tasks that already exist, only count actual insertions
+            // towards task_count, and dedupe dependents entries.
+            let mut inserted = 0usize;
             for task in tasks {
                 let key = (task.id.clone(), task.flow_id.clone());
+                if state.tasks.contains_key(&key) {
+                    continue;
+                }
                 state.index_add(&task);
                 state.tasks.insert(key, task);
+                inserted += 1;
             }
-            // Insert deps
+            // Insert deps (dedupe the reverse index)
             for (task_id, dep_ids) in deps {
                 for dep_id in &dep_ids {
-                    state
+                    let entry = state
                         .dependents
                         .entry((dep_id.clone(), flow_id.clone()))
-                        .or_default()
-                        .push(task_id.clone());
+                        .or_default();
+                    if !entry.contains(&task_id) {
+                        entry.push(task_id.clone());
+                    }
                 }
                 state.deps.insert((task_id, flow_id.clone()), dep_ids);
             }
-            // Update flow task_count
-            if let Some(flow) = state.flows.get_mut(&flow_id) {
-                flow.task_count += new_task_count;
+            // Update flow task_count by the number actually inserted
+            if inserted > 0
+                && let Some(flow) = state.flows.get_mut(&flow_id)
+            {
+                flow.task_count += inserted;
                 flow.updated_at = Utc::now();
             }
         }
@@ -715,26 +754,4 @@ fn detect_terminal_flows(state: &mut MemState) {
             flow.updated_at = Utc::now();
         }
     }
-}
-
-/// Read the journal_seq from a snapshot's _meta table.
-/// Returns 0 if the snapshot doesn't exist or has no journal_seq.
-#[allow(dead_code)]
-pub(crate) fn read_snapshot_seq(snapshot_path: &Path) -> u64 {
-    if !snapshot_path.exists() {
-        return 0;
-    }
-    let conn = match Connection::open(snapshot_path) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    conn.query_row(
-        "SELECT value FROM _meta WHERE key = 'journal_seq'",
-        [],
-        |row| {
-            let v: String = row.get(0)?;
-            Ok(v.parse::<u64>().unwrap_or(0))
-        },
-    )
-    .unwrap_or(0)
 }
