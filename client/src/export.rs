@@ -1,7 +1,7 @@
 //! Flow export operations.
 
-use crate::TaskedClient;
 use crate::error::TaskedError;
+use crate::{TaskedClient, encode_path};
 use tasked::types::FlowExport;
 
 impl TaskedClient {
@@ -12,15 +12,10 @@ impl TaskedClient {
         with_artifacts: bool,
     ) -> Result<FlowExport, TaskedError> {
         let url = format!(
-            "{}/api/v1/flows/{flow_id}/export?with_artifacts={with_artifacts}",
-            self.base_url
+            "{}/api/v1/flows/{}/export?with_artifacts={with_artifacts}",
+            self.base_url,
+            encode_path(flow_id)
         );
-        let resp = self.client.get(&url).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(self.parse_error(resp).await);
-        }
-
-        Ok(resp.json().await?)
+        self.request_json(self.client.get(&url)).await
     }
 }

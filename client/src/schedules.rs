@@ -1,7 +1,7 @@
 //! Schedule CRUD operations.
 
-use crate::TaskedClient;
-use crate::error::TaskedError;
+use crate::error::{TaskedError, parse_opt_timestamp, parse_timestamp};
+use crate::{TaskedClient, encode_path};
 use serde::{Deserialize, Serialize};
 use tasked::types::{FlowDef, QueueId, Schedule, ScheduleDef, ScheduleId};
 
@@ -23,6 +23,10 @@ struct ScheduleResponse {
     name: Option<String>,
     cron: String,
     enabled: bool,
+    /// The flow definition, if the server includes it in the response.
+    /// Current server versions omit it from all schedule responses.
+    #[serde(default)]
+    flow_def: Option<FlowDef>,
     last_triggered_at: Option<String>,
     next_run_at: Option<String>,
     created_at: String,
@@ -30,123 +34,122 @@ struct ScheduleResponse {
 }
 
 impl ScheduleResponse {
-    fn into_schedule(self, flow_def: FlowDef) -> Schedule {
-        Schedule {
+    /// Convert to a [`Schedule`], preferring the `flow_def` from the response
+    /// body and falling back to `fallback` (e.g. the flow definition that was
+    /// submitted in a create/update request) when the server omits it.
+    fn into_schedule(mut self, fallback: Option<FlowDef>) -> Result<Schedule, TaskedError> {
+        let flow_def = self
+            .flow_def
+            .take()
+            .or(fallback)
+            .unwrap_or_default();
+        Ok(Schedule {
             id: ScheduleId::from(self.id),
             queue_id: QueueId::from(self.queue_id),
             name: self.name,
-            cron: self.cron.clone(),
+            cron: self.cron,
             flow_def,
             enabled: self.enabled,
-            last_triggered_at: self.last_triggered_at.and_then(|s| s.parse().ok()),
-            next_run_at: self.next_run_at.and_then(|s| s.parse().ok()),
-            created_at: self
-                .created_at
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            updated_at: self
-                .updated_at
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
-        }
-    }
-
-    /// Convert to a Schedule with a placeholder flow_def (for list/get where
-    /// the server response doesn't include the full flow definition).
-    fn into_schedule_no_flow(self) -> Schedule {
-        let placeholder = FlowDef {
-            tasks: vec![],
-            ..FlowDef::default()
-        };
-        self.into_schedule(placeholder)
+            last_triggered_at: parse_opt_timestamp(self.last_triggered_at, "last_triggered_at")?,
+            next_run_at: parse_opt_timestamp(self.next_run_at, "next_run_at")?,
+            created_at: parse_timestamp(&self.created_at, "created_at")?,
+            updated_at: parse_timestamp(&self.updated_at, "updated_at")?,
+        })
     }
 }
 
 impl TaskedClient {
     /// Create a new schedule in a queue.
+    ///
+    /// The returned [`Schedule::flow_def`] is the definition you submitted
+    /// (the server's response does not echo it back).
     pub async fn create_schedule(
         &self,
         queue_id: &str,
         schedule_def: ScheduleDef,
     ) -> Result<Schedule, TaskedError> {
-        let url = format!("{}/api/v1/queues/{queue_id}/schedules", self.base_url);
+        let url = format!(
+            "{}/api/v1/queues/{}/schedules",
+            self.base_url,
+            encode_path(queue_id)
+        );
         let req = ScheduleRequest {
             cron: schedule_def.cron,
             flow: schedule_def.flow.clone(),
             name: schedule_def.name,
             enabled: schedule_def.enabled,
         };
-        let resp = self.client.post(&url).json(&req).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(self.parse_error(resp).await);
-        }
-
-        let body: ScheduleResponse = resp.json().await?;
-        Ok(body.into_schedule(schedule_def.flow))
+        let body: ScheduleResponse = self
+            .request_json(self.client.post(&url).json(&req))
+            .await?;
+        body.into_schedule(Some(schedule_def.flow))
     }
 
     /// List all schedules in a queue.
+    ///
+    /// Note: the server's schedule list response does not include the flow
+    /// definition. If a response omits the `flow_def` field, the returned
+    /// [`Schedule::flow_def`] is an empty [`FlowDef::default()`]; it does not
+    /// reflect the schedule's actual flow definition.
     pub async fn list_schedules(&self, queue_id: &str) -> Result<Vec<Schedule>, TaskedError> {
-        let url = format!("{}/api/v1/queues/{queue_id}/schedules", self.base_url);
-        let resp = self.client.get(&url).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(self.parse_error(resp).await);
-        }
-
-        let body: Vec<ScheduleResponse> = resp.json().await?;
-        Ok(body
-            .into_iter()
-            .map(|s| s.into_schedule_no_flow())
-            .collect())
+        let url = format!(
+            "{}/api/v1/queues/{}/schedules",
+            self.base_url,
+            encode_path(queue_id)
+        );
+        let body: Vec<ScheduleResponse> = self.request_json(self.client.get(&url)).await?;
+        body.into_iter().map(|s| s.into_schedule(None)).collect()
     }
 
     /// Get a schedule by ID.
+    ///
+    /// Note: the server's schedule response does not include the flow
+    /// definition. If the response omits the `flow_def` field, the returned
+    /// [`Schedule::flow_def`] is an empty [`FlowDef::default()`]; it does not
+    /// reflect the schedule's actual flow definition.
     pub async fn get_schedule(&self, schedule_id: &str) -> Result<Schedule, TaskedError> {
-        let url = format!("{}/api/v1/schedules/{schedule_id}", self.base_url);
-        let resp = self.client.get(&url).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(self.parse_error(resp).await);
-        }
-
-        let body: ScheduleResponse = resp.json().await?;
-        Ok(body.into_schedule_no_flow())
+        let url = format!(
+            "{}/api/v1/schedules/{}",
+            self.base_url,
+            encode_path(schedule_id)
+        );
+        let body: ScheduleResponse = self.request_json(self.client.get(&url)).await?;
+        body.into_schedule(None)
     }
 
     /// Update a schedule.
+    ///
+    /// The returned [`Schedule::flow_def`] is the definition you submitted
+    /// (the server's response does not echo it back).
     pub async fn update_schedule(
         &self,
         schedule_id: &str,
         schedule_def: ScheduleDef,
     ) -> Result<Schedule, TaskedError> {
-        let url = format!("{}/api/v1/schedules/{schedule_id}", self.base_url);
+        let url = format!(
+            "{}/api/v1/schedules/{}",
+            self.base_url,
+            encode_path(schedule_id)
+        );
         let req = ScheduleRequest {
             cron: schedule_def.cron,
             flow: schedule_def.flow.clone(),
             name: schedule_def.name,
             enabled: schedule_def.enabled,
         };
-        let resp = self.client.put(&url).json(&req).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(self.parse_error(resp).await);
-        }
-
-        let body: ScheduleResponse = resp.json().await?;
-        Ok(body.into_schedule(schedule_def.flow))
+        let body: ScheduleResponse = self
+            .request_json(self.client.put(&url).json(&req))
+            .await?;
+        body.into_schedule(Some(schedule_def.flow))
     }
 
     /// Delete a schedule.
     pub async fn delete_schedule(&self, schedule_id: &str) -> Result<(), TaskedError> {
-        let url = format!("{}/api/v1/schedules/{schedule_id}", self.base_url);
-        let resp = self.client.delete(&url).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(self.parse_error(resp).await);
-        }
-
-        Ok(())
+        let url = format!(
+            "{}/api/v1/schedules/{}",
+            self.base_url,
+            encode_path(schedule_id)
+        );
+        self.request_empty(self.client.delete(&url)).await
     }
 }

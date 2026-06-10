@@ -1,7 +1,7 @@
 //! Task ack operations.
 
-use crate::TaskedClient;
-use crate::error::TaskedError;
+use crate::error::{TaskedError, parse_opt_timestamp, parse_timestamp};
+use crate::{TaskedClient, encode_path};
 use serde::{Deserialize, Serialize};
 use tasked::types::*;
 
@@ -24,12 +24,12 @@ pub(crate) struct TaskResponse {
 }
 
 impl TaskResponse {
-    pub(crate) fn into_task(self) -> Task {
-        Task {
+    pub(crate) fn into_task(self) -> Result<Task, TaskedError> {
+        Ok(Task {
             id: TaskId::from(self.id),
             flow_id: FlowId::from(self.flow_id),
             queue_id: QueueId::from(self.queue_id),
-            state: parse_task_state(&self.state),
+            state: parse_task_state(&self.state)?,
             executor_type: self.executor_type,
             executor_config: serde_json::Value::Null,
             input: self.input,
@@ -40,26 +40,25 @@ impl TaskResponse {
             timeout_secs: self.timeout_secs,
             condition: None,
             retry_at: None,
-            started_at: self.started_at.and_then(|s| s.parse().ok()),
-            completed_at: self.completed_at.and_then(|s| s.parse().ok()),
-            created_at: self
-                .created_at
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
-        }
+            started_at: parse_opt_timestamp(self.started_at, "started_at")?,
+            completed_at: parse_opt_timestamp(self.completed_at, "completed_at")?,
+            created_at: parse_timestamp(&self.created_at, "created_at")?,
+        })
     }
 }
 
-fn parse_task_state(s: &str) -> TaskState {
+fn parse_task_state(s: &str) -> Result<TaskState, TaskedError> {
     match s {
-        "pending" => TaskState::Pending,
-        "ready" => TaskState::Ready,
-        "running" => TaskState::Running,
-        "succeeded" => TaskState::Succeeded,
-        "failed" => TaskState::Failed,
-        "delayed" => TaskState::Delayed,
-        "cancelled" => TaskState::Cancelled,
-        _ => TaskState::Pending,
+        "pending" => Ok(TaskState::Pending),
+        "ready" => Ok(TaskState::Ready),
+        "running" => Ok(TaskState::Running),
+        "succeeded" => Ok(TaskState::Succeeded),
+        "failed" => Ok(TaskState::Failed),
+        "delayed" => Ok(TaskState::Delayed),
+        "cancelled" => Ok(TaskState::Cancelled),
+        other => Err(TaskedError::InvalidResponse(format!(
+            "unknown task state: {other:?}"
+        ))),
     }
 }
 
@@ -97,8 +96,10 @@ impl TaskedClient {
         ack: TaskAck,
     ) -> Result<(), TaskedError> {
         let url = format!(
-            "{}/api/v1/flows/{flow_id}/tasks/{task_id}/ack",
-            self.base_url
+            "{}/api/v1/flows/{}/tasks/{}/ack",
+            self.base_url,
+            encode_path(flow_id),
+            encode_path(task_id)
         );
 
         let req = match ack {
@@ -121,12 +122,6 @@ impl TaskedClient {
             },
         };
 
-        let resp = self.client.post(&url).json(&req).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(self.parse_error(resp).await);
-        }
-
-        Ok(())
+        self.request_empty(self.client.post(&url).json(&req)).await
     }
 }
