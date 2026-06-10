@@ -10,17 +10,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tasked::{
-    engine::{Engine, EngineConfig, EngineError},
-    executor::{
-        CallbackExecutor, NoopExecutor, approval::ApprovalExecutor, delay::DelayExecutor,
-        http::HttpExecutor, remote::RemoteExecutor, shell::ShellExecutor, spawn::SpawnExecutor,
-        trigger::TriggerExecutor,
-    },
-    store::sharded::ShardedStorage,
+    engine::{Engine, EngineConfig},
     types::*,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info, warn};
+
+use crate::bootstrap::{ExecutorProfile, open_storage, register_executors};
+use crate::dto::default_enabled;
+use crate::error::engine_error_message;
 
 // -- JSON-RPC types --
 
@@ -336,44 +334,11 @@ fn tool_definitions() -> Value {
 /// Run the MCP server on stdio.
 pub async fn run_mcp_server(data_dir: String, engine_mode: String) {
     // Create storage backend based on --engine flag
-    let storage: Arc<dyn tasked::store::Storage> = match engine_mode.as_str() {
-        "sqlite" => {
-            let storage = ShardedStorage::open(&data_dir).expect("failed to open data directory");
-            Arc::new(storage)
-        }
-        #[cfg(feature = "journaled")]
-        "journal" => {
-            let data_path = std::path::PathBuf::from(&data_dir);
-            std::fs::create_dir_all(&data_path).expect("failed to create data directory");
-            let config = tasked::store::journaled::config::JournalConfig {
-                journal_path: Some(data_path.join("journal.db")),
-                snapshot_path: Some(data_path.join("snapshot.db")),
-                ..Default::default()
-            };
-            let storage = tasked::store::journaled::JournaledStorage::open(config)
-                .expect("failed to open journaled storage");
-            info!(engine = "journal", data_dir = %data_dir, "using journaled in-memory engine");
-            Arc::new(storage)
-        }
-        other => {
-            eprintln!("unknown engine mode: {other} (valid: sqlite, journal)");
-            std::process::exit(1);
-        }
-    };
+    let storage = open_storage(&data_dir, &engine_mode);
 
     // Create engine with all executors that work without special config
     let mut engine = Engine::new(storage, EngineConfig::default());
-    engine.register_executor("shell", Arc::new(ShellExecutor));
-    engine.register_executor("http", Arc::new(HttpExecutor::new()));
-    engine.register_executor("noop", Arc::new(NoopExecutor));
-    engine.register_executor("delay", Arc::new(DelayExecutor));
-    engine.register_executor("approval", Arc::new(ApprovalExecutor));
-    engine.register_executor("callback", Arc::new(CallbackExecutor::always_succeed()));
-    engine.register_executor("remote", Arc::new(RemoteExecutor::new()));
-    engine.register_executor("trigger", Arc::new(TriggerExecutor));
-    // Spawn must be registered last — it captures a snapshot of the executor registry.
-    let executors = engine.executors().clone();
-    engine.register_executor("spawn", Arc::new(SpawnExecutor::new(executors)));
+    register_executors(&mut engine, ExecutorProfile::Mcp);
 
     let engine = Arc::new(engine);
 
@@ -851,10 +816,6 @@ struct CreateScheduleInput {
     enabled: bool,
 }
 
-fn default_enabled() -> bool {
-    true
-}
-
 async fn tool_create_schedule(engine: &Arc<Engine>, args: Value) -> Result<String, ToolError> {
     let input: CreateScheduleInput = serde_json::from_value(args)
         .map_err(|e| ToolError::param(format!("Invalid arguments: {e}")))?;
@@ -965,32 +926,6 @@ fn parse_flow_state(s: &str) -> Result<FlowState, String> {
         other => Err(format!(
             "Invalid flow state: '{other}'. Must be one of: running, succeeded, failed, cancelled"
         )),
-    }
-}
-
-fn engine_error_message(err: EngineError) -> String {
-    match err {
-        EngineError::QueueNotFound(id) => format!("Queue '{id}' not found"),
-        EngineError::NoExecutor(name) => {
-            format!(
-                "No executor registered for type '{name}'. Available: shell, http, noop, delay, approval, spawn, trigger, callback, remote"
-            )
-        }
-        EngineError::Graph(e) => format!("Invalid DAG: {e}"),
-        EngineError::InvalidCronExpression(msg) => format!("Invalid cron expression: {msg}"),
-        EngineError::Spawn(msg) => format!("Spawn error: {msg}"),
-        EngineError::TriggerDepthExceeded(max) => {
-            format!("Trigger depth limit ({max}) exceeded")
-        }
-        EngineError::TaskLimitExceeded(max) => {
-            format!("Flow task limit ({max}) exceeded")
-        }
-        EngineError::FlowLimitExceeded(queue, max) => {
-            format!("Queue '{queue}' has reached its pending flow limit ({max})")
-        }
-        EngineError::InvalidQueueConfig(msg) => format!("Invalid queue config: {msg}"),
-        EngineError::Storage(e) => format!("Storage error: {e}"),
-        EngineError::Export(msg) => format!("Export error: {msg}"),
     }
 }
 
