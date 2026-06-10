@@ -47,7 +47,18 @@ impl Executor for DelayExecutor {
         debug!(task_id = %task.id, seconds, "delaying");
 
         let timeout = std::time::Duration::from_secs(task.timeout_secs);
-        let delay = std::time::Duration::from_secs_f64(seconds);
+        // try_from: from_secs_f64 panics on overflow, and `seconds` is
+        // attacker-controllable JSON (e.g. 1e300). A panic here aborts the
+        // spawned executor task and strands the task in Running forever.
+        let delay = match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(d) => d,
+            Err(_) => {
+                return ExecuteResult::Failed {
+                    error: format!("'seconds' value {seconds} is out of range"),
+                    retryable: false,
+                };
+            }
+        };
 
         if delay > timeout {
             return ExecuteResult::Failed {

@@ -35,6 +35,8 @@ pub enum EngineError {
     Export(String),
     #[error("queue '{0}' has reached its pending flow limit ({1})")]
     FlowLimitExceeded(String, usize),
+    #[error("invalid queue config: {0}")]
+    InvalidQueueConfig(String),
 }
 
 /// Result of evaluating a task condition expression.
@@ -605,6 +607,38 @@ impl Engine {
 
     // -- Queue operations --
 
+    /// Validate user-supplied queue configuration. Values that would panic or
+    /// wedge the dispatcher (zero concurrency, zero/NaN/infinite rate limits)
+    /// are rejected up front.
+    fn validate_queue_config(config: &QueueConfig) -> Result<(), EngineError> {
+        if config.concurrency == 0 {
+            return Err(EngineError::InvalidQueueConfig(
+                "concurrency must be at least 1".into(),
+            ));
+        }
+        if let Some(ref rl) = config.rate_limit {
+            if rl.max_burst == 0 {
+                return Err(EngineError::InvalidQueueConfig(
+                    "rate_limit.max_burst must be at least 1".into(),
+                ));
+            }
+            if !rl.per_second.is_finite() || rl.per_second <= 0.0 {
+                return Err(EngineError::InvalidQueueConfig(format!(
+                    "rate_limit.per_second must be a positive finite number, got {}",
+                    rl.per_second
+                )));
+            }
+            if rl.per_second > RateLimiter::MAX_PER_SECOND {
+                return Err(EngineError::InvalidQueueConfig(format!(
+                    "rate_limit.per_second must be at most {}, got {}",
+                    RateLimiter::MAX_PER_SECOND,
+                    rl.per_second
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new queue with the given ID and configuration.
     #[instrument(skip(self, config), fields(queue_id = %id))]
     pub async fn create_queue(
@@ -612,6 +646,7 @@ impl Engine {
         id: &QueueId,
         config: QueueConfig,
     ) -> Result<Queue, EngineError> {
+        Self::validate_queue_config(&config)?;
         let now = Utc::now();
         let queue = Queue {
             id: id.clone(),

@@ -17,15 +17,29 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
+    /// Maximum supported refill rate (one token per nanosecond).
+    pub const MAX_PER_SECOND: f64 = 1_000_000_000.0;
+
     /// Create a new rate limiter.
     ///
     /// - `max_burst`: maximum tokens that can be stored (burst capacity)
     /// - `per_second`: tokens added per second (refill rate)
+    ///
+    /// Out-of-range values are clamped to the nearest valid value rather than
+    /// panicking: queue configs come from API users, and a panic here happens
+    /// inside a spawned dispatch task where it would silently stop the queue.
+    /// Validate configs up front with [`crate::types::RateLimitConfig`]
+    /// consumers (e.g. `Engine::create_queue`) to reject them instead.
     pub fn new(max_burst: u64, per_second: f64) -> Self {
-        assert!(per_second > 0.0, "per_second must be positive");
-        assert!(max_burst > 0, "max_burst must be positive");
+        let max_burst = max_burst.max(1);
+        let per_second = if per_second.is_finite() && per_second > 0.0 {
+            per_second.min(Self::MAX_PER_SECOND)
+        } else {
+            1.0
+        };
 
-        let nanos_per_token = (1_000_000_000.0 / per_second) as u64;
+        // per_second is in (0, 1e9], so this is always >= 1 — refill() divides by it.
+        let nanos_per_token = ((1_000_000_000.0 / per_second) as u64).max(1);
         let epoch = Instant::now();
 
         Self {

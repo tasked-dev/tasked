@@ -966,6 +966,7 @@ fn engine_error_message(err: EngineError) -> String {
         EngineError::FlowLimitExceeded(queue, max) => {
             format!("Queue '{queue}' has reached its pending flow limit ({max})")
         }
+        EngineError::InvalidQueueConfig(msg) => format!("Invalid queue config: {msg}"),
         EngineError::Storage(e) => format!("Storage error: {e}"),
         EngineError::Export(msg) => format!("Export error: {msg}"),
     }

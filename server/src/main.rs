@@ -418,6 +418,10 @@ impl From<EngineError> for ApiError {
                 error: "flow_limit_exceeded".to_string(),
                 message: format!("Queue '{queue}' has reached its pending flow limit ({max})"),
             },
+            EngineError::InvalidQueueConfig(msg) => ApiError::BadRequest {
+                error: "invalid_queue_config".to_string(),
+                message: msg.clone(),
+            },
             EngineError::Storage(e) => map_storage_error(e),
             EngineError::Export(msg) => ApiError::Internal {
                 error: "export_failed".to_string(),
