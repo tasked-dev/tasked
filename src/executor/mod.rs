@@ -101,6 +101,8 @@ pub trait FlowSubmitter: Send + Sync {
         parent_flow_id: Option<FlowId>,
     ) -> Result<Flow, String>;
     async fn query_flow(&self, flow_id: &FlowId) -> Result<Option<Flow>, String>;
+    /// Cancel a flow (used by the trigger executor to stop an orphaned child).
+    async fn cancel_flow(&self, flow_id: &FlowId) -> Result<(), String>;
 }
 
 /// Context passed to executors during task execution.
@@ -122,6 +124,9 @@ pub struct ExecutionContext {
     /// should release this early to avoid deadlocking the queue.
     /// Uses Mutex for interior mutability so executors can release via `&self`.
     concurrency_permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+    /// Flow-level cancellation signal from the engine. `true` once the flow
+    /// (or this task, via fail_fast) has been cancelled.
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl ExecutionContext {
@@ -136,7 +141,14 @@ impl ExecutionContext {
             trigger_depth: 0,
             flow_submitter: None,
             concurrency_permit: std::sync::Mutex::new(None),
+            cancel: None,
         }
+    }
+
+    /// Attach the engine's flow-level cancellation signal.
+    pub fn with_cancellation(mut self, rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.cancel = Some(rx);
+        self
     }
 
     /// Configure artifact storage paths for this execution.
@@ -190,12 +202,53 @@ impl ExecutionContext {
     /// Used by long-running executors (e.g., trigger with wait) to detect
     /// cancellation and exit early. Best-effort — returns false on errors.
     pub async fn is_cancelled(&self) -> bool {
+        if self.cancel_requested() {
+            return true;
+        }
         self.store
             .get_task(&self.task_id, &self.flow_id)
             .await
             .ok()
             .flatten()
             .is_some_and(|t| t.state == TaskState::Cancelled)
+    }
+
+    /// Non-blocking check of the engine's cancellation signal.
+    /// Unlike [`Self::is_cancelled`], this performs no storage round-trip.
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|rx| *rx.borrow())
+    }
+
+    /// Clone the raw cancellation receiver, for handing into components that
+    /// outlive a borrow of the context (e.g. container backend specs).
+    pub fn cancel_receiver(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.cancel.clone()
+    }
+
+    /// Resolves when the engine cancels this task's flow (or never, if no
+    /// cancellation signal was attached). Executors should race long-running
+    /// work against this and clean up their external resources (child
+    /// processes, containers, in-flight requests) when it fires.
+    pub async fn cancelled(&self) {
+        match self.cancel.clone() {
+            Some(mut rx) => {
+                if *rx.borrow() {
+                    return;
+                }
+                // Wait until the engine flips the signal (or it is dropped at
+                // flow finalization — also treated as "stop waiting" only when
+                // the last seen value was true).
+                while rx.changed().await.is_ok() {
+                    if *rx.borrow() {
+                        return;
+                    }
+                }
+                // Sender dropped without signaling: the flow finalized
+                // normally. Never resolve — completion wins the race.
+                std::future::pending::<()>().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
     }
 }
 

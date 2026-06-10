@@ -153,6 +153,9 @@ pub struct ContainerSpec {
     pub pids_limit: i64,
     /// Docker network mode (default: "none" for isolation).
     pub network_mode: String,
+    /// Engine cancellation signal: backends should kill and clean up the
+    /// container (instead of running to timeout) once this reads `true`.
+    pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// Result from running a container.
@@ -417,6 +420,7 @@ impl Executor for ContainerExecutor {
             nano_cpus,
             pids_limit,
             network_mode,
+            cancel: ctx.cancel_receiver(),
         };
 
         debug!(task_id = %task.id, image = %spec.image, "running container");
@@ -757,6 +761,14 @@ pub mod docker {
             // Uses polling instead of the wait API for broad Docker backend compatibility.
             let deadline = tokio::time::Instant::now() + spec.timeout;
             let exit_code = loop {
+                // Engine-level cancellation: kill and remove the container
+                // instead of letting it run until its timeout.
+                if spec.cancel.as_ref().is_some_and(|rx| *rx.borrow()) {
+                    let _ = self.client.kill_container(&container.id, None).await;
+                    cleanup_container(&self.client, &container.id).await;
+                    return Err("task cancelled".to_string());
+                }
+
                 if tokio::time::Instant::now() > deadline {
                     let _ = self.client.kill_container(&container.id, None).await;
                     cleanup_container(&self.client, &container.id).await;

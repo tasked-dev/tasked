@@ -120,10 +120,11 @@ impl Executor for ShellExecutor {
         };
 
         // Captured before the capture future borrows `child`, so the timeout
-        // path can still kill the process group after the future is dropped.
+        // and cancellation paths can still kill the process group after the
+        // future is dropped.
         let child_pid = child.id();
 
-        let result = tokio::time::timeout(timeout, async {
+        let capture = tokio::time::timeout(timeout, async {
             let mut stdout_pipe = child.stdout.take().expect("stdout pipe configured");
             let mut stderr_pipe = child.stderr.take().expect("stderr pipe configured");
 
@@ -184,8 +185,29 @@ impl Executor for ShellExecutor {
                 stderr.push_str(TRUNCATION_MARKER);
             }
             Ok::<_, std::io::Error>((stdout, stderr, status))
-        })
-        .await;
+        });
+
+        // Race the capture against engine-level cancellation so a cancelled
+        // flow doesn't leave the command running until its timeout. The
+        // capture future borrows `child`, so it must be dropped (scope end)
+        // before the cancellation path can kill the child directly.
+        let result = {
+            tokio::pin!(capture);
+            tokio::select! {
+                r = &mut capture => Some(r),
+                _ = ctx.cancelled() => None,
+            }
+        };
+
+        let Some(result) = result else {
+            kill_process_group(child_pid);
+            let _ = child.kill().await;
+            debug!(task_id = %task.id, "shell command aborted — task cancelled");
+            return ExecuteResult::Failed {
+                error: "task cancelled".to_string(),
+                retryable: false,
+            };
+        };
 
         match result {
             Ok(Ok((stdout, stderr, status))) => {

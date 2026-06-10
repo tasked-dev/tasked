@@ -19,7 +19,7 @@ pub struct DelayExecutor;
 
 #[async_trait]
 impl Executor for DelayExecutor {
-    async fn execute(&self, task: &Task, _ctx: &ExecutionContext) -> ExecuteResult {
+    async fn execute(&self, task: &Task, ctx: &ExecutionContext) -> ExecuteResult {
         let seconds = match task.executor_config.get("seconds") {
             Some(v) => match v.as_f64() {
                 Some(s) if s >= 0.0 => s,
@@ -70,10 +70,14 @@ impl Executor for DelayExecutor {
             };
         }
 
-        tokio::time::sleep(delay).await;
-
-        ExecuteResult::Success {
-            output: Some(json!({ "delayed_seconds": seconds })),
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => ExecuteResult::Success {
+                output: Some(json!({ "delayed_seconds": seconds })),
+            },
+            _ = ctx.cancelled() => ExecuteResult::Failed {
+                error: "task cancelled".to_string(),
+                retryable: false,
+            },
         }
     }
 }

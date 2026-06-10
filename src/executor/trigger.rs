@@ -122,12 +122,19 @@ impl Executor for TriggerExecutor {
 
         loop {
             if tokio::time::Instant::now() >= deadline {
+                // Cancel the child: leaving it running while failing the
+                // trigger orphans side-effectful work, and a retry would
+                // submit a *second* identical child flow. Non-retryable for
+                // the same reason.
+                if let Err(e) = submitter.cancel_flow(&child.id).await {
+                    debug!(child_flow_id = %child.id, error = %e, "failed to cancel timed-out child flow");
+                }
                 return ExecuteResult::Failed {
                     error: format!(
-                        "trigger timed out waiting for child flow after {}s",
-                        task.timeout_secs
+                        "trigger timed out waiting for child flow after {}s (child flow {} cancelled)",
+                        task.timeout_secs, child.id
                     ),
-                    retryable: true,
+                    retryable: false,
                 };
             }
             tokio::time::sleep(Duration::from_millis(500)).await;

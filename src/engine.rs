@@ -321,6 +321,10 @@ pub struct Engine {
     queue_workers: std::sync::Mutex<HashMap<QueueId, (u64, tokio::task::JoinHandle<()>)>>,
     /// Monotonic source of worker ids.
     worker_seq: std::sync::atomic::AtomicU64,
+    /// Per-flow cancellation signals handed to executors via ExecutionContext.
+    /// Set to true by cancel_flow / fail_fast so running executors can abort
+    /// their work (kill processes, remove containers, drop requests).
+    flow_cancel_txs: std::sync::Mutex<HashMap<FlowId, tokio::sync::watch::Sender<bool>>>,
     /// Set by [`Engine::shutdown`]; makes `run()` exit and stops dispatch.
     shutdown: std::sync::atomic::AtomicBool,
     /// Lightweight counters for status reporting (not Prometheus — internal only).
@@ -420,6 +424,7 @@ impl EngineBuilder {
             queue_notifiers: std::sync::Mutex::new(HashMap::new()),
             queue_workers: std::sync::Mutex::new(HashMap::new()),
             worker_seq: std::sync::atomic::AtomicU64::new(0),
+            flow_cancel_txs: std::sync::Mutex::new(HashMap::new()),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             stats: EngineStats::new(),
         }
@@ -978,6 +983,10 @@ impl Engine {
             .update_flow_state(flow_id, FlowState::Cancelled)
             .await?;
 
+        // Tell running executors to abort (kill processes/containers, drop
+        // requests) — must happen before the cache eviction drops the sender.
+        self.signal_flow_cancel(flow_id);
+
         // Evict per-flow caches — flow is terminal
         self.evict_flow_caches(flow_id);
 
@@ -1473,6 +1482,34 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(flow_id);
+        self.flow_cancel_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(flow_id);
+    }
+
+    /// Get (or create) the cancellation receiver for a flow, for handing to
+    /// an executor about to run one of its tasks.
+    fn flow_cancel_rx(&self, flow_id: &FlowId) -> tokio::sync::watch::Receiver<bool> {
+        let mut txs = self
+            .flow_cancel_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        txs.entry(flow_id.clone())
+            .or_insert_with(|| tokio::sync::watch::channel(false).0)
+            .subscribe()
+    }
+
+    /// Signal all running executors of a flow to abort their work.
+    fn signal_flow_cancel(&self, flow_id: &FlowId) {
+        if let Some(tx) = self
+            .flow_cancel_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(flow_id)
+        {
+            let _ = tx.send(true);
+        }
     }
 
     /// If every task in the flow has reached a terminal state, transition the
@@ -2040,12 +2077,14 @@ impl Engine {
             let executor = entry.executor;
             let permit = entry.permit;
             let trigger_depth = entry.trigger_depth;
+            let cancel_rx = self.flow_cancel_rx(&task.flow_id);
             tokio::spawn(async move {
                 let ctx = ExecutionContext::new(store, task.id.clone(), task.flow_id.clone())
                     .with_artifacts(artifacts_dir, None)
                     .with_flow_submitter(submitter)
                     .with_trigger_depth(trigger_depth)
-                    .with_concurrency_permit(permit);
+                    .with_concurrency_permit(permit)
+                    .with_cancellation(cancel_rx);
                 let dispatch_time = std::time::Instant::now();
                 let result = executor.execute(&task, &ctx).await;
                 metrics::histogram!(
@@ -2372,6 +2411,9 @@ impl Engine {
                                 );
                             }
                         }
+
+                        // Tell running executors of this flow to abort
+                        self.signal_flow_cancel(&task.flow_id);
 
                         // Propagate cancellation to child flows
                         self.cancel_child_flows(&task.flow_id).await;
@@ -3055,6 +3097,10 @@ impl FlowSubmitter for EngineFlowSubmitter {
 
     async fn query_flow(&self, flow_id: &FlowId) -> Result<Option<Flow>, String> {
         self.0.get_flow(flow_id).await.map_err(|e| e.to_string())
+    }
+
+    async fn cancel_flow(&self, flow_id: &FlowId) -> Result<(), String> {
+        self.0.cancel_flow(flow_id).await.map_err(|e| e.to_string())
     }
 }
 

@@ -111,7 +111,7 @@ struct RemoteResponse {
 
 #[async_trait]
 impl Executor for RemoteExecutor {
-    async fn execute(&self, task: &Task, _ctx: &ExecutionContext) -> ExecuteResult {
+    async fn execute(&self, task: &Task, ctx: &ExecutionContext) -> ExecuteResult {
         let config = &task.executor_config;
 
         let url = match config.get("url").and_then(|v| v.as_str()) {
@@ -196,7 +196,17 @@ impl Executor for RemoteExecutor {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        match request.send().await {
+        // Abort the in-flight request if the flow is cancelled.
+        let send_result = tokio::select! {
+            r = request.send() => r,
+            _ = ctx.cancelled() => {
+                return ExecuteResult::Failed {
+                    error: "task cancelled".to_string(),
+                    retryable: false,
+                };
+            }
+        };
+        match send_result {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body = match super::read_response_body(resp).await {
