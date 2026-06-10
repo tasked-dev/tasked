@@ -2,6 +2,8 @@ use super::sqlite::SqliteStorage;
 use super::{Storage, StorageError};
 use crate::types::*;
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
+use rusqlite::params;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -61,7 +63,10 @@ impl ShardedStorage {
     }
 
     /// Get a shard for `queue_id`, opening it if necessary.
-    fn get_or_open_shard(&self, queue_id: &QueueId) -> Result<Arc<SqliteStorage>, StorageError> {
+    ///
+    /// Opening (file creation + schema init) is blocking I/O, so it runs on
+    /// the tokio blocking pool.
+    async fn get_or_open_shard(&self, queue_id: &QueueId) -> Result<Arc<SqliteStorage>, StorageError> {
         // Fast path: read lock
         {
             let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
@@ -69,20 +74,21 @@ impl ShardedStorage {
                 return Ok(shard.clone());
             }
         }
-        // Slow path: write lock + double-check
-        let mut shards = self.shards.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(shard) = shards.get(queue_id) {
-            return Ok(shard.clone());
-        }
+        // Slow path: open on a blocking thread, then insert (first opener wins).
         let path = self.queue_db_path(queue_id);
-        let shard = Arc::new(SqliteStorage::open_queue(&path)?);
-        shards.insert(queue_id.clone(), shard.clone());
-        Ok(shard)
+        let opened = tokio::task::spawn_blocking(move || SqliteStorage::open_queue(&path))
+            .await
+            .map_err(|e| StorageError::Internal(format!("open shard task panicked: {e}")))??;
+        let mut shards = self.shards.write().unwrap_or_else(|e| e.into_inner());
+        Ok(shards
+            .entry(queue_id.clone())
+            .or_insert_with(|| Arc::new(opened))
+            .clone())
     }
 
     /// Resolve a flow ID to the queue that owns it. Checks in-memory cache first,
     /// falls back to catalog DB only on cache miss.
-    fn resolve_flow_queue(&self, flow_id: &FlowId) -> Result<QueueId, StorageError> {
+    async fn resolve_flow_queue(&self, flow_id: &FlowId) -> Result<QueueId, StorageError> {
         // Fast path: in-memory cache (RwLock read — no DB contention)
         {
             let cache = self.flow_cache.read().unwrap_or_else(|e| e.into_inner());
@@ -91,25 +97,34 @@ impl ShardedStorage {
             }
         }
         // Slow path: catalog DB lookup + cache populate
+        let fid = flow_id.as_str().to_owned();
         let qid = self
             .catalog
-            .query_row_optional(
-                "SELECT queue_id FROM flow_map WHERE flow_id = ?1",
-                &[&flow_id.as_str() as &dyn rusqlite::ToSql],
-                |row| row.get::<_, String>(0),
-            )?
+            .with_conn(move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT queue_id FROM flow_map WHERE flow_id = ?1",
+                        params![fid],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .await?
             .map(QueueId::from)
             .ok_or_else(|| StorageError::FlowNotFound(flow_id.as_str().to_owned()))?;
         // Populate cache for future lookups
         self.flow_cache
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(flow_id.clone(), qid.clone());
         Ok(qid)
     }
 
     /// Resolve a schedule ID to the queue that owns it. Cache-first.
-    fn resolve_schedule_queue(&self, schedule_id: &ScheduleId) -> Result<QueueId, StorageError> {
+    async fn resolve_schedule_queue(
+        &self,
+        schedule_id: &ScheduleId,
+    ) -> Result<QueueId, StorageError> {
         {
             let cache = self
                 .schedule_cache
@@ -119,18 +134,24 @@ impl ShardedStorage {
                 return Ok(qid.clone());
             }
         }
+        let sid = schedule_id.as_str().to_owned();
         let qid = self
             .catalog
-            .query_row_optional(
-                "SELECT queue_id FROM schedule_map WHERE schedule_id = ?1",
-                &[&schedule_id.as_str() as &dyn rusqlite::ToSql],
-                |row| row.get::<_, String>(0),
-            )?
+            .with_conn(move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT queue_id FROM schedule_map WHERE schedule_id = ?1",
+                        params![sid],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .await?
             .map(QueueId::from)
             .ok_or_else(|| StorageError::ScheduleNotFound(schedule_id.as_str().to_owned()))?;
         self.schedule_cache
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(schedule_id.clone(), qid.clone());
         Ok(qid)
     }
@@ -139,28 +160,36 @@ impl ShardedStorage {
     fn load_caches(&self) -> Result<(), StorageError> {
         // Load flow_map
         {
-            let conn =
-                self.catalog
-                    .query_all("SELECT flow_id, queue_id FROM flow_map", &[], |row| {
+            let rows = self.catalog.with_conn_sync(|conn| {
+                let mut stmt = conn.prepare("SELECT flow_id, queue_id FROM flow_map")?;
+                let rows = stmt
+                    .query_map([], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?;
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })?;
             let mut cache = self.flow_cache.write().unwrap_or_else(|e| e.into_inner());
-            for (fid, qid) in conn {
+            for (fid, qid) in rows {
                 cache.insert(FlowId::from(fid), QueueId::from(qid));
             }
         }
         // Load schedule_map
         {
-            let schedules = self.catalog.query_all(
-                "SELECT schedule_id, queue_id FROM schedule_map",
-                &[],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?;
+            let rows = self.catalog.with_conn_sync(|conn| {
+                let mut stmt = conn.prepare("SELECT schedule_id, queue_id FROM schedule_map")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })?;
             let mut cache = self
                 .schedule_cache
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            for (sid, qid) in schedules {
+            for (sid, qid) in rows {
                 cache.insert(ScheduleId::from(sid), QueueId::from(qid));
             }
         }
@@ -222,7 +251,7 @@ impl Storage for ShardedStorage {
         // Insert queue metadata into catalog.
         self.catalog.create_queue(queue).await?;
         // Create the shard DB file (opens + initialises schema).
-        self.get_or_open_shard(&queue.id)?;
+        self.get_or_open_shard(&queue.id).await?;
         Ok(())
     }
 
@@ -236,14 +265,17 @@ impl Storage for ShardedStorage {
 
     async fn delete_queue(&self, id: &QueueId) -> Result<(), StorageError> {
         // Clean up catalog routing tables for this queue.
-        self.catalog.execute(
-            "DELETE FROM flow_map WHERE queue_id = ?1",
-            &[&id.as_str() as &dyn rusqlite::ToSql],
-        )?;
-        self.catalog.execute(
-            "DELETE FROM schedule_map WHERE queue_id = ?1",
-            &[&id.as_str() as &dyn rusqlite::ToSql],
-        )?;
+        let qid = id.as_str().to_owned();
+        self.catalog
+            .with_conn(move |conn| {
+                conn.execute("DELETE FROM flow_map WHERE queue_id = ?1", params![qid])?;
+                conn.execute(
+                    "DELETE FROM schedule_map WHERE queue_id = ?1",
+                    params![qid],
+                )?;
+                Ok(())
+            })
+            .await?;
 
         // Evict from in-memory caches.
         {
@@ -285,35 +317,39 @@ impl Storage for ShardedStorage {
         tasks: &[Task],
         deps: &HashMap<TaskId, Vec<TaskId>>,
     ) -> Result<(), StorageError> {
-        let shard = self.get_or_open_shard(&flow.queue_id)?;
+        let shard = self.get_or_open_shard(&flow.queue_id).await?;
         shard.create_flow(flow, tasks, deps).await?;
 
         // Register the flow → queue mapping in the catalog.
-        self.catalog.execute(
-            "INSERT OR IGNORE INTO flow_map (flow_id, queue_id, parent_flow_id) VALUES (?1, ?2, ?3)",
-            &[
-                &flow.id.as_str() as &dyn rusqlite::ToSql,
-                &flow.queue_id.as_str(),
-                &flow.parent_flow_id.as_ref().map(|id| id.as_str().to_owned()) as &dyn rusqlite::ToSql,
-            ],
-        )?;
+        let fid = flow.id.as_str().to_owned();
+        let qid = flow.queue_id.as_str().to_owned();
+        let parent = flow.parent_flow_id.as_ref().map(|id| id.as_str().to_owned());
+        self.catalog
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO flow_map (flow_id, queue_id, parent_flow_id) VALUES (?1, ?2, ?3)",
+                    params![fid, qid, parent],
+                )?;
+                Ok(())
+            })
+            .await?;
 
         // Populate in-memory cache.
         self.flow_cache
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(flow.id.clone(), flow.queue_id.clone());
 
         Ok(())
     }
 
     async fn get_flow(&self, id: &FlowId) -> Result<Option<Flow>, StorageError> {
-        let queue_id = match self.resolve_flow_queue(id) {
+        let queue_id = match self.resolve_flow_queue(id).await {
             Ok(qid) => qid,
             Err(StorageError::FlowNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.get_flow(id).await
     }
 
@@ -322,13 +358,13 @@ impl Storage for ShardedStorage {
         queue_id: &QueueId,
         state: Option<FlowState>,
     ) -> Result<Vec<Flow>, StorageError> {
-        let shard = self.get_or_open_shard(queue_id)?;
+        let shard = self.get_or_open_shard(queue_id).await?;
         shard.list_flows(queue_id, state).await
     }
 
     async fn update_flow_state(&self, id: &FlowId, state: FlowState) -> Result<(), StorageError> {
-        let queue_id = self.resolve_flow_queue(id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.update_flow_state(id, state).await
     }
 
@@ -337,8 +373,8 @@ impl Storage for ShardedStorage {
         id: &FlowId,
         succeeded: bool,
     ) -> Result<Flow, StorageError> {
-        let queue_id = self.resolve_flow_queue(id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.increment_flow_counter(id, succeeded).await
     }
 
@@ -349,18 +385,18 @@ impl Storage for ShardedStorage {
         task_id: &TaskId,
         flow_id: &FlowId,
     ) -> Result<Option<Task>, StorageError> {
-        let queue_id = match self.resolve_flow_queue(flow_id) {
+        let queue_id = match self.resolve_flow_queue(flow_id).await {
             Ok(qid) => qid,
             Err(StorageError::FlowNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.get_task(task_id, flow_id).await
     }
 
     async fn get_flow_tasks(&self, flow_id: &FlowId) -> Result<Vec<Task>, StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.get_flow_tasks(flow_id).await
     }
 
@@ -368,12 +404,12 @@ impl Storage for ShardedStorage {
         &self,
         flow_id: &FlowId,
     ) -> Result<Option<(Flow, Vec<Task>)>, StorageError> {
-        let queue_id = match self.resolve_flow_queue(flow_id) {
+        let queue_id = match self.resolve_flow_queue(flow_id).await {
             Ok(qid) => qid,
             Err(StorageError::FlowNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.get_flow_with_tasks(flow_id).await
     }
 
@@ -382,7 +418,7 @@ impl Storage for ShardedStorage {
         queue_id: &QueueId,
         limit: usize,
     ) -> Result<Vec<Task>, StorageError> {
-        let shard = self.get_or_open_shard(queue_id)?;
+        let shard = self.get_or_open_shard(queue_id).await?;
         shard.fetch_ready_tasks(queue_id, limit).await
     }
 
@@ -410,8 +446,8 @@ impl Storage for ShardedStorage {
         flow_id: &FlowId,
         new_state: TaskState,
     ) -> Result<(), StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.update_task_state(task_id, flow_id, new_state).await
     }
 
@@ -420,8 +456,8 @@ impl Storage for ShardedStorage {
         task_id: &TaskId,
         flow_id: &FlowId,
     ) -> Result<(), StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.mark_task_running(task_id, flow_id).await
     }
 
@@ -433,8 +469,8 @@ impl Storage for ShardedStorage {
             return Ok(vec![]);
         }
         // All tasks in a dispatch batch share the same queue — resolve from the first flow_id.
-        let queue_id = self.resolve_flow_queue(tasks[0].1)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(tasks[0].1).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.mark_tasks_running_batch(tasks).await
     }
 
@@ -444,8 +480,8 @@ impl Storage for ShardedStorage {
         flow_id: &FlowId,
         output: serde_json::Value,
     ) -> Result<(), StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.set_task_output(task_id, flow_id, output).await
     }
 
@@ -455,8 +491,8 @@ impl Storage for ShardedStorage {
         flow_id: &FlowId,
         output: Option<serde_json::Value>,
     ) -> Result<(), StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.mark_task_succeeded(task_id, flow_id, output).await
     }
 
@@ -466,8 +502,8 @@ impl Storage for ShardedStorage {
         flow_id: &FlowId,
         error: &str,
     ) -> Result<(), StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.mark_task_failed(task_id, flow_id, error).await
     }
 
@@ -477,8 +513,8 @@ impl Storage for ShardedStorage {
         flow_id: &FlowId,
         retry_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.mark_task_delayed(task_id, flow_id, retry_at).await
     }
 
@@ -486,8 +522,8 @@ impl Storage for ShardedStorage {
         &self,
         flow_id: &FlowId,
     ) -> Result<HashMap<TaskId, Vec<TaskId>>, StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.get_flow_dependencies(flow_id).await
     }
 
@@ -496,8 +532,8 @@ impl Storage for ShardedStorage {
         task_id: &TaskId,
         flow_id: &FlowId,
     ) -> Result<Vec<TaskId>, StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.get_task_dependencies(task_id, flow_id).await
     }
 
@@ -506,14 +542,14 @@ impl Storage for ShardedStorage {
         task_id: &TaskId,
         flow_id: &FlowId,
     ) -> Result<Vec<TaskId>, StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.get_task_dependents(task_id, flow_id).await
     }
 
     async fn resolve_ready_tasks(&self, flow_id: &FlowId) -> Result<Vec<TaskId>, StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.resolve_ready_tasks(flow_id).await
     }
 
@@ -523,8 +559,8 @@ impl Storage for ShardedStorage {
         flow_id: &FlowId,
         output: Option<serde_json::Value>,
     ) -> Result<(Flow, Vec<TaskId>), StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.complete_task_success(task_id, flow_id, output).await
     }
 
@@ -535,8 +571,8 @@ impl Storage for ShardedStorage {
         output: Option<serde_json::Value>,
         newly_ready: &[TaskId],
     ) -> Result<Flow, StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard
             .complete_task_with_ready(task_id, flow_id, output, newly_ready)
             .await
@@ -551,8 +587,8 @@ impl Storage for ShardedStorage {
         }
         // All completions in a process_completions_batch call are from the same queue,
         // so resolve the shard from the first entry and delegate the entire batch.
-        let queue_id = self.resolve_flow_queue(&completions[0].1)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(&completions[0].1).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.complete_tasks_with_ready_batch(completions).await
     }
 
@@ -562,8 +598,8 @@ impl Storage for ShardedStorage {
         tasks: &[Task],
         deps: &HashMap<TaskId, Vec<TaskId>>,
     ) -> Result<Flow, StorageError> {
-        let queue_id = self.resolve_flow_queue(flow_id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_flow_queue(flow_id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.inject_tasks(flow_id, tasks, deps).await
     }
 
@@ -571,11 +607,18 @@ impl Storage for ShardedStorage {
         &self,
         parent_flow_id: &FlowId,
     ) -> Result<Vec<FlowId>, StorageError> {
-        let rows = self.catalog.query_all(
-            "SELECT flow_id FROM flow_map WHERE parent_flow_id = ?1",
-            &[&parent_flow_id.as_str() as &dyn rusqlite::ToSql],
-            |row| row.get::<_, String>(0),
-        )?;
+        let pid = parent_flow_id.as_str().to_owned();
+        let rows = self
+            .catalog
+            .with_conn(move |conn| {
+                let mut stmt =
+                    conn.prepare_cached("SELECT flow_id FROM flow_map WHERE parent_flow_id = ?1")?;
+                let rows = stmt
+                    .query_map(params![pid], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await?;
         Ok(rows.into_iter().map(FlowId::from).collect())
     }
 
@@ -584,7 +627,7 @@ impl Storage for ShardedStorage {
         queue_id: &QueueId,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<usize, StorageError> {
-        let shard = self.get_or_open_shard(queue_id)?;
+        let shard = self.get_or_open_shard(queue_id).await?;
         let deleted = shard.delete_terminal_flows_before(queue_id, cutoff).await?;
 
         // Lazily clean up stale flow_map entries: remove any flow_map rows
@@ -593,44 +636,45 @@ impl Storage for ShardedStorage {
         // FlowNotFound if the shard doesn't have the flow), but this is a
         // good opportunity to keep the catalog tidy.
         if deleted > 0 {
+            // Collect remaining flow IDs from the shard.
+            let remaining = shard.list_flows(queue_id, None).await?;
+            let remaining_ids: Vec<String> =
+                remaining.iter().map(|f| f.id.to_string()).collect();
+
             // Evict deleted flows from in-memory cache.
             {
-                let remaining = shard.list_flows(queue_id, None).await?;
                 let remaining_set: std::collections::HashSet<FlowId> =
                     remaining.into_iter().map(|f| f.id).collect();
                 let mut fc = self.flow_cache.write().unwrap_or_else(|e| e.into_inner());
                 fc.retain(|fid, qid| qid != queue_id || remaining_set.contains(fid));
             }
 
-            // Collect remaining flow IDs from the shard.
-            let remaining = shard.list_flows(queue_id, None).await?;
-            let remaining_ids: Vec<String> =
-                remaining.into_iter().map(|f| f.id.to_string()).collect();
-
-            if remaining_ids.is_empty() {
-                // All flows for this queue have been deleted.
-                self.catalog.execute(
-                    "DELETE FROM flow_map WHERE queue_id = ?1",
-                    &[&queue_id.as_str() as &dyn rusqlite::ToSql],
-                )?;
-            } else {
-                // Build a parameterised IN clause.
-                let placeholders: Vec<String> = (0..remaining_ids.len())
-                    .map(|i| format!("?{}", i + 2))
-                    .collect();
-                let sql = format!(
-                    "DELETE FROM flow_map WHERE queue_id = ?1 AND flow_id NOT IN ({})",
-                    placeholders.join(", ")
-                );
-                let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                    vec![Box::new(queue_id.as_str().to_owned())];
-                for id in &remaining_ids {
-                    params.push(Box::new(id.clone()));
-                }
-                let param_refs: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|p| p.as_ref()).collect();
-                self.catalog.execute(&sql, &param_refs)?;
-            }
+            let qid = queue_id.as_str().to_owned();
+            self.catalog
+                .with_conn(move |conn| {
+                    if remaining_ids.is_empty() {
+                        // All flows for this queue have been deleted.
+                        conn.execute("DELETE FROM flow_map WHERE queue_id = ?1", params![qid])?;
+                    } else {
+                        // Build a parameterised IN clause.
+                        let placeholders: Vec<String> = (0..remaining_ids.len())
+                            .map(|i| format!("?{}", i + 2))
+                            .collect();
+                        let sql = format!(
+                            "DELETE FROM flow_map WHERE queue_id = ?1 AND flow_id NOT IN ({})",
+                            placeholders.join(", ")
+                        );
+                        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(qid)];
+                        for id in &remaining_ids {
+                            sql_params.push(Box::new(id.clone()));
+                        }
+                        let param_refs: Vec<&dyn rusqlite::ToSql> =
+                            sql_params.iter().map(|p| p.as_ref()).collect();
+                        conn.execute(&sql, param_refs.as_slice())?;
+                    }
+                    Ok(())
+                })
+                .await?;
         }
 
         Ok(deleted)
@@ -639,57 +683,67 @@ impl Storage for ShardedStorage {
     // ---- Schedule methods ----
 
     async fn create_schedule(&self, schedule: &Schedule) -> Result<(), StorageError> {
-        let shard = self.get_or_open_shard(&schedule.queue_id)?;
+        let shard = self.get_or_open_shard(&schedule.queue_id).await?;
         shard.create_schedule(schedule).await?;
 
         // Register schedule → queue mapping in the catalog.
-        self.catalog.execute(
-            "INSERT OR IGNORE INTO schedule_map (schedule_id, queue_id) VALUES (?1, ?2)",
-            &[
-                &schedule.id.as_str() as &dyn rusqlite::ToSql,
-                &schedule.queue_id.as_str(),
-            ],
-        )?;
+        let sid = schedule.id.as_str().to_owned();
+        let qid = schedule.queue_id.as_str().to_owned();
+        self.catalog
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO schedule_map (schedule_id, queue_id) VALUES (?1, ?2)",
+                    params![sid, qid],
+                )?;
+                Ok(())
+            })
+            .await?;
 
         // Populate cache.
         self.schedule_cache
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(schedule.id.clone(), schedule.queue_id.clone());
 
         Ok(())
     }
 
     async fn get_schedule(&self, id: &ScheduleId) -> Result<Option<Schedule>, StorageError> {
-        let queue_id = match self.resolve_schedule_queue(id) {
+        let queue_id = match self.resolve_schedule_queue(id).await {
             Ok(qid) => qid,
             Err(StorageError::ScheduleNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.get_schedule(id).await
     }
 
     async fn list_schedules(&self, queue_id: &QueueId) -> Result<Vec<Schedule>, StorageError> {
-        let shard = self.get_or_open_shard(queue_id)?;
+        let shard = self.get_or_open_shard(queue_id).await?;
         shard.list_schedules(queue_id).await
     }
 
     async fn update_schedule(&self, schedule: &Schedule) -> Result<(), StorageError> {
-        let shard = self.get_or_open_shard(&schedule.queue_id)?;
+        let shard = self.get_or_open_shard(&schedule.queue_id).await?;
         shard.update_schedule(schedule).await
     }
 
     async fn delete_schedule(&self, id: &ScheduleId) -> Result<(), StorageError> {
-        let queue_id = self.resolve_schedule_queue(id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_schedule_queue(id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard.delete_schedule(id).await?;
 
         // Remove from catalog routing table and cache.
-        self.catalog.execute(
-            "DELETE FROM schedule_map WHERE schedule_id = ?1",
-            &[&id.as_str() as &dyn rusqlite::ToSql],
-        )?;
+        let sid = id.as_str().to_owned();
+        self.catalog
+            .with_conn(move |conn| {
+                conn.execute(
+                    "DELETE FROM schedule_map WHERE schedule_id = ?1",
+                    params![sid],
+                )?;
+                Ok(())
+            })
+            .await?;
         self.schedule_cache
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -713,19 +767,15 @@ impl Storage for ShardedStorage {
         triggered_at: chrono::DateTime<chrono::Utc>,
         next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), StorageError> {
-        let queue_id = self.resolve_schedule_queue(id)?;
-        let shard = self.get_or_open_shard(&queue_id)?;
+        let queue_id = self.resolve_schedule_queue(id).await?;
+        let shard = self.get_or_open_shard(&queue_id).await?;
         shard
             .mark_schedule_triggered(id, triggered_at, next_run_at)
             .await
     }
 
     async fn checkpoint(&self) -> Result<(), StorageError> {
-        let shard_list: Vec<Arc<SqliteStorage>> = {
-            let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
-            shards.values().cloned().collect()
-        };
-        for shard in &shard_list {
+        for shard in self.all_shards() {
             shard.checkpoint().await?;
         }
         Ok(())
