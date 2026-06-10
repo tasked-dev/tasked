@@ -362,6 +362,12 @@ pub struct FlowWebhooks {
     /// URL to POST when flow fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_failure: Option<String>,
+    /// Optional shared secret. When set, deliveries carry an
+    /// `X-Tasked-Signature: sha256=<hex>` header containing the HMAC-SHA256
+    /// of the request body, so receivers can authenticate the sender.
+    /// Redacted from flow exports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
 /// A flow definition as submitted by the user.

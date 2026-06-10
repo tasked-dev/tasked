@@ -1062,6 +1062,17 @@ impl Engine {
             }
         }
 
+        // Webhook secrets are credentials — never include them in exports.
+        let redacted_webhooks = flow.webhooks.clone().map(|mut w| {
+            w.secret = None;
+            w
+        });
+        let redacted_flow_def = flow.flow_def.clone().map(|mut fd| {
+            if let Some(ref mut w) = fd.webhooks {
+                w.secret = None;
+            }
+            fd
+        });
         let flow_meta = FlowExportMeta {
             id: flow.id.clone(),
             queue_id: flow.queue_id.clone(),
@@ -1070,8 +1081,8 @@ impl Engine {
             tasks_succeeded: flow.tasks_succeeded,
             tasks_failed: flow.tasks_failed,
             trigger_depth: flow.trigger_depth,
-            webhooks: flow.webhooks.clone(),
-            flow_def: flow.flow_def.clone(),
+            webhooks: redacted_webhooks,
+            flow_def: redacted_flow_def,
             created_at: flow.created_at,
             updated_at: flow.updated_at,
         };

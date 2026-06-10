@@ -117,30 +117,66 @@ pub fn allow_loopback_for_tests(allow: bool) {
     ALLOW_LOOPBACK.with(|cell| cell.set(allow));
 }
 
-/// Validate that a URL does not target a private or reserved IP address.
-///
-/// Resolves the hostname via DNS and checks all resolved addresses.
-/// Returns `Ok(())` if the URL is safe to request, or `Err` with a reason.
-pub fn validate_url(url: &str) -> Result<(), String> {
+/// Check a URL's host without DNS: returns `Ok(Some(()))` if the host is an
+/// IP literal that passed validation, `Ok(None)` if it is a hostname that
+/// still needs resolving, or `Err` if it is a blocked IP literal.
+fn validate_url_pre_dns<'a>(url: &'a str) -> Result<Option<&'a str>, String> {
     let host = extract_host(url).ok_or_else(|| format!("cannot parse host from URL: {url}"))?;
 
     // If the host is a raw IP, check it directly
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return check_ip(ip);
+        check_ip(ip)?;
+        return Ok(None);
     }
 
     // Handle IPv6 bracket notation: [::1]
     if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
         && let Ok(ip) = inner.parse::<Ipv6Addr>()
     {
-        return check_ip(IpAddr::V6(ip));
+        check_ip(IpAddr::V6(ip))?;
+        return Ok(None);
     }
+
+    Ok(Some(host))
+}
+
+/// Validate that a URL does not target a private or reserved IP address.
+///
+/// Resolves the hostname via DNS and checks all resolved addresses.
+/// Returns `Ok(())` if the URL is safe to request, or `Err` with a reason.
+///
+/// Note: hostname resolution here is blocking — prefer
+/// [`validate_url_async`] from async contexts. This sync version exists for
+/// the reqwest redirect-policy callback, which cannot await.
+pub fn validate_url(url: &str) -> Result<(), String> {
+    let Some(host) = validate_url_pre_dns(url)? else {
+        return Ok(());
+    };
 
     // Resolve hostname and check all addresses
     let port = extract_port(url).unwrap_or(80);
     let addr_str = format!("{host}:{port}");
     let addrs = addr_str
         .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed for '{host}': {e}"))?;
+
+    for addr in addrs {
+        check_ip(addr.ip())?;
+    }
+
+    Ok(())
+}
+
+/// Async variant of [`validate_url`] using tokio's resolver, so a slow DNS
+/// server can't pin an async runtime worker thread.
+pub async fn validate_url_async(url: &str) -> Result<(), String> {
+    let Some(host) = validate_url_pre_dns(url)? else {
+        return Ok(());
+    };
+
+    let port = extract_port(url).unwrap_or(80);
+    let addrs = tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
         .map_err(|e| format!("DNS resolution failed for '{host}': {e}"))?;
 
     for addr in addrs {
@@ -181,14 +217,26 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
     octets[0] == 0
     // 10.0.0.0/8 — private
     || octets[0] == 10
+    // 100.64.0.0/10 — carrier-grade NAT
+    || (octets[0] == 100 && (64..=127).contains(&octets[1]))
     // 127.0.0.0/8 — loopback
     || octets[0] == 127
     // 169.254.0.0/16 — link-local (cloud metadata)
     || (octets[0] == 169 && octets[1] == 254)
     // 172.16.0.0/12 — private
     || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+    // 192.0.0.0/24 — IETF protocol assignments
+    || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 — documentation
+    || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+    || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+    || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
     // 192.168.0.0/16 — private
     || (octets[0] == 192 && octets[1] == 168)
+    // 198.18.0.0/15 — benchmarking
+    || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+    // 224.0.0.0/4 — multicast; 240.0.0.0/4 — reserved (incl. broadcast)
+    || octets[0] >= 224
 }
 
 fn is_private_v6(ip: Ipv6Addr) -> bool {
@@ -206,6 +254,10 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
     || (ip.segments()[0] & 0xfe00) == 0xfc00
     // fe80::/10 — link-local
     || (ip.segments()[0] & 0xffc0) == 0xfe80
+    // ff00::/8 — multicast
+    || (ip.segments()[0] & 0xff00) == 0xff00
+    // 2001:db8::/32 — documentation
+    || (ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
     // ::ffff:0:0/96 — IPv4-mapped (check the embedded v4)
     || ip.to_ipv4_mapped().is_some_and(is_private_v4)
 }
