@@ -41,13 +41,23 @@ pub fn extract_fields(body: &Value, config: &ResponseConfig) -> Value {
 /// Supports object field access and array index access:
 /// - `"user.name"` → `body["user"]["name"]`
 /// - `"items.0.id"` → `body["items"][0]["id"]`
-fn navigate_path(value: &Value, path: &str) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').collect();
+///
+/// Shared by response extraction, pagination cursor lookup and template
+/// interpolation (single source of truth for dot-path navigation).
+pub(crate) fn navigate_path(value: &Value, path: &str) -> Option<Value> {
+    navigate_segments(value, path.split('.'))
+}
+
+/// Navigate a JSON value by pre-split path segments.
+pub(crate) fn navigate_segments<'a>(
+    value: &Value,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Option<Value> {
     let mut current = value;
 
-    for segment in &segments {
+    for segment in segments {
         current = match current {
-            Value::Object(map) => map.get(*segment)?,
+            Value::Object(map) => map.get(segment)?,
             Value::Array(arr) => {
                 let idx: usize = segment.parse().ok()?;
                 arr.get(idx)?
@@ -57,4 +67,24 @@ fn navigate_path(value: &Value, path: &str) -> Option<Value> {
     }
 
     Some(current.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn navigates_objects_and_arrays() {
+        let body = json!({"user": {"name": "Alice"}, "items": [{"id": 7}]});
+        assert_eq!(navigate_path(&body, "user.name"), Some(json!("Alice")));
+        assert_eq!(navigate_path(&body, "items.0.id"), Some(json!(7)));
+        assert_eq!(navigate_path(&body, "missing"), None);
+    }
+
+    #[test]
+    fn empty_segments_return_value_itself() {
+        let body = json!({"a": 1});
+        assert_eq!(navigate_segments(&body, []), Some(body.clone()));
+    }
 }

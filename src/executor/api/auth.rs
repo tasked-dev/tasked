@@ -16,8 +16,11 @@ pub enum ResolvedAuth {
 }
 
 /// Resolve authentication config templates into a reusable `ResolvedAuth`.
-pub fn resolve_auth(auth: &AuthConfig, ctx: &InterpolationContext) -> ResolvedAuth {
-    match auth {
+///
+/// OAuth2 cannot be resolved here — it requires the async token refresh flow
+/// in `IntegrationExecutor` — so it returns an error instead of panicking.
+pub fn resolve_auth(auth: &AuthConfig, ctx: &InterpolationContext) -> Result<ResolvedAuth, String> {
+    Ok(match auth {
         AuthConfig::Header {
             header,
             value_template,
@@ -43,11 +46,12 @@ pub fn resolve_auth(auth: &AuthConfig, ctx: &InterpolationContext) -> ResolvedAu
             token: resolve_template(token_template, ctx),
         },
         AuthConfig::OAuth2 { .. } => {
-            // OAuth2 is resolved separately in IntegrationExecutor::execute()
-            // via the token refresh flow. This branch should not be reached.
-            unreachable!("OAuth2 auth should be resolved before calling resolve_auth")
+            return Err(
+                "OAuth2 auth must be resolved via the token refresh flow, not resolve_auth"
+                    .to_string(),
+            );
         }
-    }
+    })
 }
 
 impl ResolvedAuth {

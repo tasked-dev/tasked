@@ -5,6 +5,7 @@
 
 use super::auth::ResolvedAuth;
 use super::definition::PaginationConfig;
+use super::response::navigate_path;
 use crate::executor::read_response_body;
 use crate::types::ExecuteResult;
 use reqwest::Client;
@@ -120,76 +121,100 @@ pub async fn execute_paginated(
     }
 }
 
+/// One successfully fetched page of a paginated request.
+struct FetchedPage {
+    status: u16,
+    body: Value,
+    /// Next-page URL from the `Link` header (already SSRF-validated), if any.
+    next_link: Option<String>,
+}
+
+/// Error from fetching a single page.
+struct PageError {
+    error: String,
+    retryable: bool,
+}
+
+/// Send one paginated request, read the body (size-capped) and handle non-2xx
+/// statuses. Shared by all pagination strategies.
+async fn fetch_page(
+    template: &RequestTemplate,
+    url_override: Option<&str>,
+    extra_query: &[(String, String)],
+) -> Result<FetchedPage, PageError> {
+    let request = template.build_request(url_override, extra_query);
+    let resp = request.send().await.map_err(|e| PageError {
+        retryable: e.is_timeout() || e.is_connect(),
+        error: format!("HTTP request failed: {e}"),
+    })?;
+
+    let status = resp.status().as_u16();
+
+    // Parse the Link header for a next URL before consuming the body.
+    let mut next_link = resp
+        .headers()
+        .get("link")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_link_next);
+
+    // Validate next URL against SSRF policy
+    if let Some(ref url) = next_link
+        && crate::url_policy::validate_url(url).is_err()
+    {
+        next_link = None;
+    }
+
+    let body = read_response_body(resp).await.map_err(|e| PageError {
+        error: e,
+        retryable: false,
+    })?;
+
+    if !(200..300).contains(&status) {
+        return Err(PageError {
+            error: format!(
+                "HTTP {status}: {}",
+                crate::executor::truncate_body_for_error(&body)
+            ),
+            retryable: status >= 500,
+        });
+    }
+
+    let body = serde_json::from_str(&body).unwrap_or(Value::String(body));
+    Ok(FetchedPage {
+        status,
+        body,
+        next_link,
+    })
+}
+
 /// Link header pagination: follow `rel="next"` URLs.
 async fn paginate_link_header(template: &RequestTemplate, max_pages: u32) -> ExecuteResult {
     let mut all_items: Vec<Value> = Vec::new();
     let mut next_url: Option<String> = None;
     let mut pages = 0u32;
     let mut last_status = 200u16;
+    let mut partial_error: Option<String> = None;
 
-    loop {
-        if pages >= max_pages {
-            break;
-        }
-
-        let request = template.build_request(next_url.as_deref(), &[]);
-        let resp = match request.send().await {
-            Ok(r) => r,
+    while pages < max_pages {
+        let page = match fetch_page(template, next_url.as_deref(), &[]).await {
+            Ok(p) => p,
             Err(e) => {
-                if pages > 0 {
-                    // We got some pages, return what we have
-                    break;
+                if pages == 0 {
+                    return ExecuteResult::Failed {
+                        error: e.error,
+                        retryable: e.retryable,
+                    };
                 }
-                let retryable = e.is_timeout() || e.is_connect();
-                return ExecuteResult::Failed {
-                    error: format!("HTTP request failed: {e}"),
-                    retryable,
-                };
+                // Keep the pages already collected, but flag the result partial.
+                partial_error = Some(e.error);
+                break;
             }
         };
 
-        last_status = resp.status().as_u16();
+        last_status = page.status;
+        next_url = page.next_link;
 
-        // Parse Link header for next URL before consuming the body
-        next_url = resp
-            .headers()
-            .get("link")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_link_next);
-
-        // Validate next URL against SSRF policy
-        if let Some(ref url) = next_url
-            && crate::url_policy::validate_url(url).is_err()
-        {
-            next_url = None;
-        }
-
-        let body = match read_response_body(resp).await {
-            Ok(b) => b,
-            Err(e) => {
-                if pages > 0 {
-                    break;
-                }
-                return ExecuteResult::Failed {
-                    error: e,
-                    retryable: false,
-                };
-            }
-        };
-
-        if !(200..300).contains(&last_status) {
-            if pages > 0 {
-                break; // Return what we have
-            }
-            return ExecuteResult::Failed {
-                error: format!("HTTP {last_status}: {body}"),
-                retryable: last_status >= 500,
-            };
-        }
-
-        let body_value: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
-
-        collect_items(&body_value, &mut all_items);
+        collect_items(&page.body, &mut all_items);
         pages += 1;
 
         debug!(pages, items = all_items.len(), "paginated: fetched page");
@@ -199,7 +224,7 @@ async fn paginate_link_header(template: &RequestTemplate, max_pages: u32) -> Exe
         }
     }
 
-    build_paginated_result(last_status, pages, all_items)
+    build_paginated_result(last_status, pages, all_items, partial_error)
 }
 
 /// Cursor pagination: extract cursor from response, send as query param.
@@ -213,66 +238,38 @@ async fn paginate_cursor(
     let mut cursor: Option<String> = None;
     let mut pages = 0u32;
     let mut last_status = 200u16;
+    let mut partial_error: Option<String> = None;
 
-    loop {
-        if pages >= max_pages {
-            break;
-        }
-
+    while pages < max_pages {
         let extra_query: Vec<(String, String)> = cursor
             .as_ref()
             .map(|c| vec![(param.to_string(), c.clone())])
             .unwrap_or_default();
 
-        let request = template.build_request(None, &extra_query);
-        let resp = match request.send().await {
-            Ok(r) => r,
+        let page = match fetch_page(template, None, &extra_query).await {
+            Ok(p) => p,
             Err(e) => {
-                if pages > 0 {
-                    break;
+                if pages == 0 {
+                    return ExecuteResult::Failed {
+                        error: e.error,
+                        retryable: e.retryable,
+                    };
                 }
-                let retryable = e.is_timeout() || e.is_connect();
-                return ExecuteResult::Failed {
-                    error: format!("HTTP request failed: {e}"),
-                    retryable,
-                };
-            }
-        };
-
-        last_status = resp.status().as_u16();
-        let body = match read_response_body(resp).await {
-            Ok(b) => b,
-            Err(e) => {
-                if pages > 0 {
-                    break;
-                }
-                return ExecuteResult::Failed {
-                    error: e,
-                    retryable: false,
-                };
-            }
-        };
-
-        if !(200..300).contains(&last_status) {
-            if pages > 0 {
+                partial_error = Some(e.error);
                 break;
             }
-            return ExecuteResult::Failed {
-                error: format!("HTTP {last_status}: {body}"),
-                retryable: last_status >= 500,
-            };
-        }
+        };
 
-        let body_value: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
+        last_status = page.status;
 
         // Extract cursor for next page
-        cursor = navigate_json_path(&body_value, response_path).and_then(|v| match v {
+        cursor = navigate_path(&page.body, response_path).and_then(|v| match v {
             Value::String(s) if !s.is_empty() => Some(s),
             Value::Number(n) => Some(n.to_string()),
             _ => None,
         });
 
-        collect_items(&body_value, &mut all_items);
+        collect_items(&page.body, &mut all_items);
         pages += 1;
 
         debug!(pages, items = all_items.len(), cursor = ?cursor, "paginated: fetched page");
@@ -282,7 +279,7 @@ async fn paginate_cursor(
         }
     }
 
-    build_paginated_result(last_status, pages, all_items)
+    build_paginated_result(last_status, pages, all_items, partial_error)
 }
 
 /// Offset pagination: increment offset by limit each page.
@@ -297,60 +294,32 @@ async fn paginate_offset(
     let mut offset = 0u32;
     let mut pages = 0u32;
     let mut last_status = 200u16;
+    let mut partial_error: Option<String> = None;
 
-    loop {
-        if pages >= max_pages {
-            break;
-        }
-
+    while pages < max_pages {
         let extra_query = vec![
             (param.to_string(), offset.to_string()),
             (limit_param.to_string(), limit.to_string()),
         ];
 
-        let request = template.build_request(None, &extra_query);
-        let resp = match request.send().await {
-            Ok(r) => r,
+        let page = match fetch_page(template, None, &extra_query).await {
+            Ok(p) => p,
             Err(e) => {
-                if pages > 0 {
-                    break;
+                if pages == 0 {
+                    return ExecuteResult::Failed {
+                        error: e.error,
+                        retryable: e.retryable,
+                    };
                 }
-                let retryable = e.is_timeout() || e.is_connect();
-                return ExecuteResult::Failed {
-                    error: format!("HTTP request failed: {e}"),
-                    retryable,
-                };
-            }
-        };
-
-        last_status = resp.status().as_u16();
-        let body = match read_response_body(resp).await {
-            Ok(b) => b,
-            Err(e) => {
-                if pages > 0 {
-                    break;
-                }
-                return ExecuteResult::Failed {
-                    error: e,
-                    retryable: false,
-                };
-            }
-        };
-
-        if !(200..300).contains(&last_status) {
-            if pages > 0 {
+                partial_error = Some(e.error);
                 break;
             }
-            return ExecuteResult::Failed {
-                error: format!("HTTP {last_status}: {body}"),
-                retryable: last_status >= 500,
-            };
-        }
+        };
 
-        let body_value: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
+        last_status = page.status;
 
-        let page_item_count = count_items(&body_value);
-        collect_items(&body_value, &mut all_items);
+        let page_item_count = count_items(&page.body);
+        collect_items(&page.body, &mut all_items);
         pages += 1;
         offset += limit;
 
@@ -367,7 +336,7 @@ async fn paginate_offset(
         }
     }
 
-    build_paginated_result(last_status, pages, all_items)
+    build_paginated_result(last_status, pages, all_items, partial_error)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -389,23 +358,6 @@ fn parse_link_next(header: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Navigate a JSON value by a dot-separated path.
-fn navigate_json_path(value: &Value, path: &str) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let mut current = value;
-    for segment in &segments {
-        current = match current {
-            Value::Object(map) => map.get(*segment)?,
-            Value::Array(arr) => {
-                let idx: usize = segment.parse().ok()?;
-                arr.get(idx)?
-            }
-            _ => return None,
-        };
-    }
-    Some(current.clone())
 }
 
 /// Collect items from a response body into the accumulator.
@@ -449,12 +401,78 @@ fn count_items(body: &Value) -> usize {
 }
 
 /// Build the final paginated result.
-fn build_paginated_result(status: u16, pages: u32, items: Vec<Value>) -> ExecuteResult {
+///
+/// When pagination aborted mid-way (`partial_error` is `Some`), the output
+/// carries `"partial": true` and an `"error"` field so callers can tell the
+/// collected items are incomplete rather than mistaking them for a full
+/// result set.
+fn build_paginated_result(
+    status: u16,
+    pages: u32,
+    items: Vec<Value>,
+    partial_error: Option<String>,
+) -> ExecuteResult {
+    let mut output = json!({
+        "status": status,
+        "pages": pages,
+        "body": Value::Array(items),
+    });
+    if let Some(error) = partial_error {
+        let obj = output.as_object_mut().expect("output is an object");
+        obj.insert("partial".to_string(), json!(true));
+        obj.insert("error".to_string(), json!(error));
+    }
     ExecuteResult::Success {
-        output: Some(json!({
-            "status": status,
-            "pages": pages,
-            "body": Value::Array(items),
-        })),
+        output: Some(output),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_link_next_extracts_next_url() {
+        let header = r#"<https://api.example.com/p2>; rel="next", <https://api.example.com/p1>; rel="prev""#;
+        assert_eq!(
+            parse_link_next(header).as_deref(),
+            Some("https://api.example.com/p2")
+        );
+        assert_eq!(parse_link_next(r#"<https://x>; rel="prev""#), None);
+    }
+
+    #[test]
+    fn complete_result_has_no_partial_flag() {
+        let result = build_paginated_result(200, 2, vec![json!(1), json!(2)], None);
+        match result {
+            ExecuteResult::Success { output: Some(out) } => {
+                assert_eq!(out["pages"], 2);
+                assert!(out.get("partial").is_none());
+                assert!(out.get("error").is_none());
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_result_carries_flag_and_error() {
+        let result =
+            build_paginated_result(200, 1, vec![json!(1)], Some("HTTP 500: boom".to_string()));
+        match result {
+            ExecuteResult::Success { output: Some(out) } => {
+                assert_eq!(out["partial"], true);
+                assert_eq!(out["error"], "HTTP 500: boom");
+                assert_eq!(out["pages"], 1);
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_items_handles_array_and_single_array_field() {
+        let mut items = Vec::new();
+        collect_items(&json!([1, 2]), &mut items);
+        collect_items(&json!({"items": [3], "total": 10}), &mut items);
+        assert_eq!(items, vec![json!(1), json!(2), json!(3)]);
     }
 }

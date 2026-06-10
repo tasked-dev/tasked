@@ -85,6 +85,72 @@ impl IntegrationExecutor {
             token_cache: Some(token_cache),
         }
     }
+
+    /// Obtain an OAuth2 access token: cached if still valid, otherwise refresh.
+    ///
+    /// With a token cache configured, a per-cache-key async lock serializes
+    /// concurrent refreshes of the same credential (preventing a thundering
+    /// herd against the token endpoint) and the cache is re-checked after the
+    /// lock is acquired. Rotated refresh tokens returned by the endpoint are
+    /// stored and preferred over the stale template value on later refreshes.
+    /// `token_url` is SSRF-validated inside [`oauth2::refresh_token`].
+    async fn obtain_oauth2_token(
+        &self,
+        token_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        template_refresh_token: &str,
+        scopes: Option<&str>,
+        cache_key: &str,
+    ) -> Result<String, String> {
+        let Some(ref tc) = self.token_cache else {
+            // No cache — always refresh (rotated refresh tokens cannot be kept).
+            let (token, _, _) = oauth2::refresh_token(
+                &self.client,
+                token_url,
+                client_id,
+                client_secret,
+                template_refresh_token,
+                scopes,
+            )
+            .await?;
+            return Ok(token);
+        };
+
+        if let Some(cached) = tc.get_token(cache_key) {
+            debug!(integration = %self.definition.name, "using cached OAuth2 token");
+            return Ok(cached);
+        }
+
+        let lock = tc.refresh_lock(cache_key);
+        let _guard = lock.lock().await;
+
+        // Another task may have refreshed while we waited for the lock.
+        if let Some(cached) = tc.get_token(cache_key) {
+            debug!(
+                integration = %self.definition.name,
+                "using OAuth2 token refreshed by a concurrent task"
+            );
+            return Ok(cached);
+        }
+
+        // Prefer a previously rotated refresh token over the template value.
+        let refresh = tc
+            .get_refresh_token(cache_key)
+            .unwrap_or_else(|| template_refresh_token.to_string());
+
+        let (token, expires_in, rotated_refresh) = oauth2::refresh_token(
+            &self.client,
+            token_url,
+            client_id,
+            client_secret,
+            &refresh,
+            scopes,
+        )
+        .await?;
+        tc.set_token_with_refresh(cache_key, &token, expires_in, rotated_refresh.as_deref());
+        Ok(token)
+    }
 }
 
 #[async_trait]
@@ -137,11 +203,9 @@ impl Executor for IntegrationExecutor {
         let credential = config.get("credential").cloned();
         let ctx = InterpolationContext { params, credential };
 
-        // Resolve path
-        let path = match interpolate::interpolate(&Value::String(operation.path.clone()), &ctx) {
-            Value::String(s) => s,
-            other => other.to_string(),
-        };
+        // Resolve path, percent-encoding interpolated values so a parameter
+        // like `../`, `?x=y` or `#frag` cannot rewrite the request target.
+        let path = interpolate::interpolate_path(&operation.path, &ctx);
         let url = format!("{}{}", self.definition.base_url, path);
 
         if let Err(reason) = crate::url_policy::validate_url(&url) {
@@ -216,13 +280,8 @@ impl Executor for IntegrationExecutor {
                 ref refresh_token_template,
                 ref scopes,
             }) => {
-                // Validate token_url against SSRF policy
-                if let Err(reason) = crate::url_policy::validate_url(token_url) {
-                    return ExecuteResult::Failed {
-                        error: format!("SSRF blocked (OAuth2 token_url): {reason}"),
-                        retryable: false,
-                    };
-                }
+                // Note: token_url is SSRF-validated inside oauth2::refresh_token,
+                // immediately before any request is made.
 
                 // Resolve templates
                 let client_id = resolve_string(client_id_template, &ctx);
@@ -236,62 +295,35 @@ impl Executor for IntegrationExecutor {
                     .unwrap_or_default();
                 let cache_key = oauth2::cache_key(&self.definition.name, &credential_json);
 
-                // Check cache first
-                let access_token = if let Some(ref tc) = self.token_cache {
-                    if let Some(cached) = tc.get_token(&cache_key) {
-                        debug!(integration = %self.definition.name, "using cached OAuth2 token");
-                        cached
-                    } else {
-                        // Refresh
-                        match oauth2::refresh_token(
-                            &self.client,
-                            token_url,
-                            &client_id,
-                            &client_secret,
-                            &refresh_token_val,
-                            scopes.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok((token, expires_in)) => {
-                                tc.set_token(&cache_key, &token, expires_in);
-                                token
-                            }
-                            Err(e) => {
-                                return ExecuteResult::Failed {
-                                    error: format!("OAuth2 token refresh failed: {e}"),
-                                    retryable: true,
-                                };
-                            }
-                        }
-                    }
-                } else {
-                    // No cache — always refresh
-                    match oauth2::refresh_token(
-                        &self.client,
+                match self
+                    .obtain_oauth2_token(
                         token_url,
                         &client_id,
                         &client_secret,
                         &refresh_token_val,
                         scopes.as_deref(),
+                        &cache_key,
                     )
                     .await
-                    {
-                        Ok((token, _)) => token,
-                        Err(e) => {
-                            return ExecuteResult::Failed {
-                                error: format!("OAuth2 token refresh failed: {e}"),
-                                retryable: true,
-                            };
-                        }
+                {
+                    Ok(token) => Some(auth::ResolvedAuth::Bearer { token }),
+                    Err(e) => {
+                        return ExecuteResult::Failed {
+                            error: format!("OAuth2 token refresh failed: {e}"),
+                            retryable: true,
+                        };
                     }
-                };
-
-                Some(auth::ResolvedAuth::Bearer {
-                    token: access_token,
-                })
+                }
             }
-            Some(ref auth_config) => Some(auth::resolve_auth(auth_config, &ctx)),
+            Some(ref auth_config) => match auth::resolve_auth(auth_config, &ctx) {
+                Ok(resolved) => Some(resolved),
+                Err(e) => {
+                    return ExecuteResult::Failed {
+                        error: format!("failed to resolve auth: {e}"),
+                        retryable: false,
+                    };
+                }
+            },
             None => None,
         };
 
