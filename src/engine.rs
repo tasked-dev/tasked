@@ -12,6 +12,13 @@ use std::sync::Arc;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
+/// Lock a mutex, recovering the data from a poisoned lock. The engine's
+/// mutexes guard caches and buffers whose invariants hold between calls, so
+/// a panic elsewhere must not permanently wedge dispatch.
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Engine errors.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -469,10 +476,7 @@ impl Engine {
 
     /// Get or create the per-queue Notify for a given queue.
     fn get_or_create_queue_notify(&self, queue_id: &QueueId) -> Arc<Notify> {
-        let mut notifiers = self
-            .queue_notifiers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut notifiers = lock(&self.queue_notifiers);
         notifiers
             .entry(queue_id.clone())
             .or_insert_with(|| Arc::new(Notify::new()))
@@ -481,19 +485,14 @@ impl Engine {
 
     /// Wake the worker for a specific queue.
     fn notify_queue(&self, queue_id: &QueueId) {
-        if let Some(n) = self
-            .queue_notifiers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(queue_id)
-        {
+        if let Some(n) = lock(&self.queue_notifiers).get(queue_id) {
             n.notify_one();
         }
     }
 
     /// Spawn a queue worker if one is not already running.
     fn spawn_queue_worker(self: &Arc<Self>, queue_id: QueueId) {
-        let mut workers = self.queue_workers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut workers = lock(&self.queue_workers);
 
         // Check if there's already a live worker for this queue
         if let Some((_, handle)) = workers.get(&queue_id)
@@ -521,7 +520,7 @@ impl Engine {
     pub fn shutdown(&self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
-        let mut workers = self.queue_workers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut workers = lock(&self.queue_workers);
         for (_, (_, handle)) in workers.drain() {
             handle.abort();
         }
@@ -532,13 +531,7 @@ impl Engine {
 
     /// Ensure every active queue has a running worker.
     fn ensure_workers_for_active_queues(self: &Arc<Self>) {
-        let active: Vec<QueueId> = self
-            .active_queues
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect();
+        let active: Vec<QueueId> = lock(&self.active_queues).keys().cloned().collect();
         for qid in active {
             self.spawn_queue_worker(qid);
         }
@@ -548,20 +541,14 @@ impl Engine {
     async fn get_cached_queue_config(&self, queue_id: &QueueId) -> Option<QueueConfig> {
         // Fast path: check cache
         {
-            let cache = self
-                .queue_config_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let cache = lock(&self.queue_config_cache);
             if let Some(config) = cache.get(queue_id) {
                 return Some(config.clone());
             }
         }
         // Slow path: fetch from storage + populate cache
         if let Ok(Some(q)) = self.store.get_queue(queue_id).await {
-            self.queue_config_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(q.id.clone(), q.config.clone());
+            lock(&self.queue_config_cache).insert(q.id.clone(), q.config.clone());
             Some(q.config)
         } else {
             None
@@ -581,13 +568,11 @@ impl Engine {
     /// optimization (skip the DB query when zero), so it must never wrap:
     /// concurrent promoters and cancellations make exact accounting racy.
     fn dec_delayed_count(&self, by: usize) {
-        let _ = self
-            .delayed_task_count
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |v| Some(v.saturating_sub(by)),
-            );
+        let _ = self.delayed_task_count.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| Some(v.saturating_sub(by)),
+        );
     }
 
     /// Bookkeeping for a task leaving a non-terminal state via cancellation:
@@ -601,7 +586,7 @@ impl Engine {
 
     /// Ensure a semaphore exists for the given queue. Returns it.
     fn ensure_semaphore(&self, queue_id: &QueueId, concurrency: usize) -> Arc<Semaphore> {
-        let mut sems = self.semaphores.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sems = lock(&self.semaphores);
         sems.entry(queue_id.clone())
             .or_insert_with(|| Arc::new(Semaphore::new(concurrency)))
             .clone()
@@ -614,7 +599,7 @@ impl Engine {
         config: &Option<RateLimitConfig>,
     ) -> Option<Arc<RateLimiter>> {
         let rl_config = config.as_ref()?;
-        let mut limiters = self.rate_limiters.lock().unwrap_or_else(|e| e.into_inner());
+        let mut limiters = lock(&self.rate_limiters);
         Some(
             limiters
                 .entry(queue_id.clone())
@@ -676,10 +661,7 @@ impl Engine {
         };
         self.store.create_queue(&queue).await?;
         // Cache the config for fast access during process_cycle.
-        self.queue_config_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), queue.config.clone());
+        lock(&self.queue_config_cache).insert(id.clone(), queue.config.clone());
         Ok(queue)
     }
 
@@ -696,37 +678,17 @@ impl Engine {
     /// Delete a queue by ID.
     pub async fn delete_queue(&self, id: &QueueId) -> Result<(), EngineError> {
         self.store.delete_queue(id).await?;
-        self.queue_config_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-        self.active_queues
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
+        lock(&self.queue_config_cache).remove(id);
+        lock(&self.active_queues).remove(id);
         // Drop the concurrency/rate-limit state: a queue recreated with the
         // same ID must get limits from its new config, not stale ones.
-        self.semaphores
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-        self.rate_limiters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
+        lock(&self.semaphores).remove(id);
+        lock(&self.rate_limiters).remove(id);
         // Abort the queue worker (if running) and clean up its notifier.
-        if let Some((_, handle)) = self
-            .queue_workers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id)
-        {
+        if let Some((_, handle)) = lock(&self.queue_workers).remove(id) {
             handle.abort();
         }
-        self.queue_notifiers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
+        lock(&self.queue_notifiers).remove(id);
         Ok(())
     }
 
@@ -885,24 +847,15 @@ impl Engine {
         self.ensure_rate_limiter(queue_id, &queue.config.rate_limit);
 
         // Mark queue as active (bumps generation to guard against stale deactivation)
-        self.active_queues
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .activate(queue_id.clone());
+        lock(&self.active_queues).activate(queue_id.clone());
 
         // Pre-cache trigger_depth for this flow
-        self.trigger_depth_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(flow.id.clone(), flow.trigger_depth);
+        lock(&self.trigger_depth_cache).insert(flow.id.clone(), flow.trigger_depth);
 
         // Build in-memory dependency graph for O(degree) dep resolution
         let all_task_ids: Vec<TaskId> = tasks.iter().map(|t| t.id.clone()).collect();
         let dep_graph = FlowDepGraph::build(&deps, &all_task_ids);
-        self.dep_graphs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(flow.id.clone(), dep_graph);
+        lock(&self.dep_graphs).insert(flow.id.clone(), dep_graph);
 
         // Wake the per-queue worker (if running) and the main loop (to spawn worker if needed)
         self.notify_queue(queue_id);
@@ -1199,10 +1152,7 @@ impl Engine {
                         running_flows = flows.len(),
                         "recovering queue with running flows"
                     );
-                    self.active_queues
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert_startup(q.id.clone());
+                    lock(&self.active_queues).insert_startup(q.id.clone());
                     self.spawn_queue_worker(q.id.clone());
                 }
             }
@@ -1261,14 +1211,7 @@ impl Engine {
         crate::perf::counters::promote_delayed.record(t0);
 
         // 2. Collect active queue IDs (only queues with running flows)
-        let active: Vec<QueueId> = {
-            self.active_queues
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .keys()
-                .cloned()
-                .collect()
-        };
+        let active: Vec<QueueId> = { lock(&self.active_queues).keys().cloned().collect() };
 
         if active.is_empty() {
             return Ok(());
@@ -1278,19 +1221,11 @@ impl Engine {
         let t0 = std::time::Instant::now();
         let mut queue_configs = Vec::with_capacity(active.len());
         for qid in &active {
-            let cached = self
-                .queue_config_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(qid)
-                .cloned();
+            let cached = lock(&self.queue_config_cache).get(qid).cloned();
             if let Some(config) = cached {
                 queue_configs.push((qid.clone(), config));
             } else if let Ok(Some(q)) = self.store.get_queue(qid).await {
-                self.queue_config_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(q.id.clone(), q.config.clone());
+                lock(&self.queue_config_cache).insert(q.id.clone(), q.config.clone());
                 queue_configs.push((q.id, q.config));
             }
         }
@@ -1382,11 +1317,7 @@ impl Engine {
     /// The generation is read *before* the async DB query; if `submit_flow`
     /// bumps the generation in between, the removal is skipped.
     async fn deactivate_if_idle(&self, queue_id: &QueueId) -> Result<(), EngineError> {
-        let gen_before = self
-            .active_queues
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .generation(queue_id);
+        let gen_before = lock(&self.active_queues).generation(queue_id);
 
         let remaining = self
             .store
@@ -1396,10 +1327,7 @@ impl Engine {
         if remaining.is_empty()
             && let Some(expected_gen) = gen_before
         {
-            self.active_queues
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .deactivate_if_unchanged(queue_id, expected_gen);
+            lock(&self.active_queues).deactivate_if_unchanged(queue_id, expected_gen);
         }
         Ok(())
     }
@@ -1409,10 +1337,7 @@ impl Engine {
     async fn cached_trigger_depth(&self, flow_id: &FlowId) -> Result<u32, EngineError> {
         // Fast path: check cache
         {
-            let cache = self
-                .trigger_depth_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let cache = lock(&self.trigger_depth_cache);
             if let Some(&depth) = cache.get(flow_id) {
                 return Ok(depth);
             }
@@ -1424,17 +1349,14 @@ impl Engine {
             .await?
             .map(|f| f.trigger_depth)
             .unwrap_or(0);
-        self.trigger_depth_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(flow_id.clone(), depth);
+        lock(&self.trigger_depth_cache).insert(flow_id.clone(), depth);
         Ok(depth)
     }
 
     /// Resolve dependencies in-memory via FlowDepGraph. Returns newly-ready task IDs.
     /// Falls back to an empty vec if no graph is cached (e.g., flow predates the cache).
     fn resolve_deps_in_memory(&self, flow_id: &FlowId, task_id: &TaskId) -> Option<Vec<TaskId>> {
-        let mut graphs = self.dep_graphs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut graphs = lock(&self.dep_graphs);
         graphs
             .get_mut(flow_id)
             .map(|graph| graph.on_task_succeeded(task_id))
@@ -1444,7 +1366,7 @@ impl Engine {
     /// Called on first completion for flows recovered from disk without pre-built graphs.
     async fn ensure_dep_graph(&self, flow_id: &FlowId) {
         {
-            let graphs = self.dep_graphs.lock().unwrap_or_else(|e| e.into_inner());
+            let graphs = lock(&self.dep_graphs);
             if graphs.contains_key(flow_id) {
                 return;
             }
@@ -1460,41 +1382,26 @@ impl Engine {
                 .map(|t| t.id.clone())
                 .collect();
             let graph = FlowDepGraph::build_with_state(&deps, &task_ids, &succeeded);
-            self.dep_graphs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(flow_id.clone(), graph);
+            lock(&self.dep_graphs).insert(flow_id.clone(), graph);
         }
     }
 
     /// Evict the dep graph for a flow (on cancel or terminal state).
     fn evict_dep_graph(&self, flow_id: &FlowId) {
-        self.dep_graphs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(flow_id);
+        lock(&self.dep_graphs).remove(flow_id);
     }
 
     /// Drop all per-flow engine caches once a flow reaches a terminal state.
     fn evict_flow_caches(&self, flow_id: &FlowId) {
         self.evict_dep_graph(flow_id);
-        self.trigger_depth_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(flow_id);
-        self.flow_cancel_txs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(flow_id);
+        lock(&self.trigger_depth_cache).remove(flow_id);
+        lock(&self.flow_cancel_txs).remove(flow_id);
     }
 
     /// Get (or create) the cancellation receiver for a flow, for handing to
     /// an executor about to run one of its tasks.
     fn flow_cancel_rx(&self, flow_id: &FlowId) -> tokio::sync::watch::Receiver<bool> {
-        let mut txs = self
-            .flow_cancel_txs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut txs = lock(&self.flow_cancel_txs);
         txs.entry(flow_id.clone())
             .or_insert_with(|| tokio::sync::watch::channel(false).0)
             .subscribe()
@@ -1502,12 +1409,7 @@ impl Engine {
 
     /// Signal all running executors of a flow to abort their work.
     fn signal_flow_cancel(&self, flow_id: &FlowId) {
-        if let Some(tx) = self
-            .flow_cancel_txs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(flow_id)
-        {
+        if let Some(tx) = lock(&self.flow_cancel_txs).get(flow_id) {
             let _ = tx.send(true);
         }
     }
@@ -1585,9 +1487,7 @@ impl Engine {
 
     /// Buffer a successful completion for batch write by the queue's worker.
     fn buffer_completion(&self, event: CompletionEvent) {
-        self.completion_buffer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock(&self.completion_buffer)
             .entry(event.task.queue_id.clone())
             .or_default()
             .push(event);
@@ -1597,14 +1497,7 @@ impl Engine {
     /// Used by [`Engine::process_cycle`]; queue workers flush only their own
     /// queue via [`Engine::process_completions_batch`].
     async fn flush_all_completions(&self) -> Result<(), EngineError> {
-        let queue_ids: Vec<QueueId> = {
-            self.completion_buffer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .keys()
-                .cloned()
-                .collect()
-        };
+        let queue_ids: Vec<QueueId> = { lock(&self.completion_buffer).keys().cloned().collect() };
         for qid in &queue_ids {
             self.process_completions_batch(qid).await?;
         }
@@ -1620,10 +1513,7 @@ impl Engine {
     async fn process_completions_batch(&self, queue_id: &QueueId) -> Result<(), EngineError> {
         // Swap out this queue's buffer (brief Mutex hold)
         let mut events: Vec<CompletionEvent> = {
-            let mut buf = self
-                .completion_buffer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut buf = lock(&self.completion_buffer);
             buf.remove(queue_id).unwrap_or_default()
         };
 
@@ -1678,7 +1568,7 @@ impl Engine {
                 // Task was cancelled/already succeeded — storage skipped it,
                 // so roll back the in-memory dep-graph decrement.
                 if event.newly_ready.is_some() {
-                    let mut graphs = self.dep_graphs.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut graphs = lock(&self.dep_graphs);
                     if let Some(graph) = graphs.get_mut(&event.task.flow_id) {
                         graph.undo_task_succeeded(&event.task.id);
                     }
@@ -2002,10 +1892,7 @@ impl Engine {
                 self.handle_task_result(
                     &task,
                     ExecuteResult::Failed {
-                        error: format!(
-                            "no executor registered for type '{}'",
-                            task.executor_type
-                        ),
+                        error: format!("no executor registered for type '{}'", task.executor_type),
                         retryable: false,
                     },
                 )
@@ -2190,10 +2077,7 @@ impl Engine {
                 self.handle_task_result(
                     &task,
                     ExecuteResult::Failed {
-                        error: format!(
-                            "no executor registered for type '{}'",
-                            task.executor_type
-                        ),
+                        error: format!("no executor registered for type '{}'", task.executor_type),
                         retryable: false,
                     },
                 )
@@ -2763,9 +2647,7 @@ impl Engine {
                 .map(|t| t.id.clone())
                 .collect();
             let new_task_ids: Vec<TaskId> = tasks.iter().map(|t| t.id.clone()).collect();
-            self.dep_graphs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lock(&self.dep_graphs)
                 .entry(generator.flow_id.clone())
                 .and_modify(|graph| graph.inject(&deps_map, &new_task_ids, &succeeded));
         }
@@ -3126,11 +3008,7 @@ async fn queue_worker_loop(
         }
 
         // Check if queue is still active
-        let is_active = engine
-            .active_queues
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&queue_id);
+        let is_active = lock(&engine.active_queues).contains(&queue_id);
         if !is_active {
             debug!(queue_id = %queue_id, "queue worker exiting — no active flows");
             break;
@@ -3159,20 +3037,13 @@ async fn queue_worker_loop(
     // worker; removing its entry (and notifier) would strand it on a Notify
     // nobody signals.
     {
-        let mut workers = engine
-            .queue_workers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut workers = lock(&engine.queue_workers);
         let is_ours = workers
             .get(&queue_id)
             .is_some_and(|(id, _)| *id == worker_id);
         if is_ours {
             workers.remove(&queue_id);
-            engine
-                .queue_notifiers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&queue_id);
+            lock(&engine.queue_notifiers).remove(&queue_id);
         }
     }
     debug!(queue_id = %queue_id, worker_id, "queue worker stopped");
@@ -3208,13 +3079,9 @@ async fn global_sweeper_loop(engine: Arc<Engine>) {
                 }
             }
             _ = status_interval.tick() => {
-                let active_count = engine.active_queues
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                let active_count = lock(&engine.active_queues)
                     .len();
-                let worker_count = engine.queue_workers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                let worker_count = lock(&engine.queue_workers)
                     .len();
                 let fs = engine.stats.flows_submitted.load(std::sync::atomic::Ordering::Relaxed);
                 let fc = engine.stats.flows_completed.load(std::sync::atomic::Ordering::Relaxed);
