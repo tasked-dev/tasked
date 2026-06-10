@@ -1,8 +1,10 @@
 //! MCP (Model Context Protocol) server implementation.
 //!
 //! Implements the MCP protocol over stdio using JSON-RPC 2.0 with
-//! Content-Length framing (LSP-style). This allows AI agents like
-//! Claude Code to use Tasked as a tool for managing DAG workflows.
+//! newline-delimited framing, as specified by the MCP stdio transport
+//! (protocol version 2024-11-05): each message is a single line of JSON
+//! terminated by `\n`. This allows AI agents like Claude Code to use
+//! Tasked as a tool for managing DAG workflows.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,7 +81,6 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-const INTERNAL_ERROR: i64 = -32603;
 
 // -- Tool error types --
 
@@ -390,6 +391,19 @@ pub async fn run_mcp_server(data_dir: String, engine_mode: String) {
     }
 }
 
+/// Maximum accepted length of a single newline-delimited message.
+const MAX_LINE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+
+/// Result of reading one newline-delimited message from the stream.
+enum ReadLine {
+    /// End of stream with no pending data.
+    Eof,
+    /// One line, without the trailing newline.
+    Line(String),
+    /// The line exceeded `MAX_LINE_BYTES` and was discarded.
+    TooLong,
+}
+
 /// Read and process MCP messages from stdin, write responses to stdout.
 async fn stdio_loop(engine: Arc<Engine>) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = tokio::io::stdin();
@@ -397,47 +411,41 @@ async fn stdio_loop(engine: Arc<Engine>) -> Result<(), Box<dyn std::error::Error
     let mut reader = BufReader::new(stdin);
 
     loop {
-        // Read headers (Content-Length style framing)
-        let content_length = match read_content_length(&mut reader).await {
-            Ok(Some(len)) => len,
-            Ok(None) => {
+        // Read one newline-delimited JSON-RPC message.
+        let line = match read_line_capped(&mut reader, MAX_LINE_BYTES).await? {
+            ReadLine::Eof => {
                 debug!("stdin closed, shutting down MCP server");
                 return Ok(());
             }
-            Err(e) => {
-                warn!(error = %e, "failed to read MCP message headers, skipping");
-                continue;
-            }
-        };
-
-        // Read the JSON body
-        let mut body = vec![0u8; content_length];
-        if let Err(e) = tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await {
-            warn!(error = %e, "failed to read MCP message body, skipping");
-            continue;
-        }
-        let body_str = match String::from_utf8(body) {
-            Ok(s) => s,
-            Err(e) => {
+            ReadLine::TooLong => {
+                warn!(max_bytes = MAX_LINE_BYTES, "MCP message exceeds size limit, discarding");
                 let response = JsonRpcResponse::error(
                     Value::Null,
-                    INTERNAL_ERROR,
-                    format!("Invalid UTF-8 in message body: {e}"),
+                    PARSE_ERROR,
+                    format!("Parse error: message exceeds maximum size of {MAX_LINE_BYTES} bytes"),
                 );
-                write_response(&mut stdout, &response).await?;
+                write_message(&mut stdout, &response).await?;
                 continue;
             }
+            ReadLine::Line(line) => line,
         };
+
+        let body_str = line.trim();
+
+        // Skip blank lines between messages.
+        if body_str.is_empty() {
+            continue;
+        }
 
         debug!(body = %body_str, "received MCP message");
 
-        // Parse JSON-RPC
-        let request: JsonRpcRequest = match serde_json::from_str(&body_str) {
+        // Parse JSON-RPC; malformed JSON gets a -32700 parse error response.
+        let request: JsonRpcRequest = match serde_json::from_str(body_str) {
             Ok(req) => req,
             Err(e) => {
                 let response =
                     JsonRpcResponse::error(Value::Null, PARSE_ERROR, format!("Parse error: {e}"));
-                write_response(&mut stdout, &response).await?;
+                write_message(&mut stdout, &response).await?;
                 continue;
             }
         };
@@ -457,7 +465,7 @@ async fn stdio_loop(engine: Arc<Engine>) -> Result<(), Box<dyn std::error::Error
                 INVALID_REQUEST,
                 "Invalid JSON-RPC version, expected \"2.0\"",
             );
-            write_response(&mut stdout, &response).await?;
+            write_message(&mut stdout, &response).await?;
             continue;
         }
 
@@ -474,54 +482,68 @@ async fn stdio_loop(engine: Arc<Engine>) -> Result<(), Box<dyn std::error::Error
             ),
         };
 
-        write_response(&mut stdout, &response).await?;
+        write_message(&mut stdout, &response).await?;
     }
 }
 
-/// Read Content-Length header from the stream. Returns None on EOF.
-async fn read_content_length(
-    reader: &mut BufReader<tokio::io::Stdin>,
-) -> Result<Option<usize>, Box<dyn std::error::Error>> {
-    let mut content_length: Option<usize> = None;
+/// Read one line (terminated by `\n` or EOF) from the stream, enforcing a
+/// maximum length. Oversized lines are consumed and discarded without
+/// buffering more than `max` bytes, so a single huge message cannot exhaust
+/// memory. A final unterminated line before EOF is returned as a line.
+async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<ReadLine> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflow = false;
 
     loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
-
-        if bytes_read == 0 {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
             // EOF
-            return Ok(None);
+            if buf.is_empty() && !overflow {
+                return Ok(ReadLine::Eof);
+            }
+            break;
         }
 
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
-            // Empty line marks end of headers — Content-Length is required.
-            match content_length {
-                Some(len) => return Ok(Some(len)),
-                None => {
-                    return Err("Missing Content-Length header in MCP message".into());
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                if !overflow {
+                    buf.extend_from_slice(&available[..pos]);
+                }
+                reader.consume(pos + 1);
+                break;
+            }
+            None => {
+                let len = available.len();
+                if !overflow {
+                    buf.extend_from_slice(available);
+                }
+                reader.consume(len);
+                if buf.len() > max {
+                    overflow = true;
+                    buf.clear();
                 }
             }
         }
-
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            content_length = Some(value.trim().parse::<usize>()?);
-        }
-        // Ignore other headers (e.g., Content-Type)
     }
+
+    if overflow || buf.len() > max {
+        return Ok(ReadLine::TooLong);
+    }
+    Ok(ReadLine::Line(String::from_utf8_lossy(&buf).into_owned()))
 }
 
-/// Write a JSON-RPC response with Content-Length framing.
-async fn write_response(
-    stdout: &mut tokio::io::Stdout,
+/// Write a JSON-RPC response as a single newline-delimited JSON message.
+async fn write_message<W: tokio::io::AsyncWrite + Unpin>(
+    out: &mut W,
     response: &JsonRpcResponse,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string(response)?;
-    let header = format!("Content-Length: {}\r\n\r\n", json.len());
-    stdout.write_all(header.as_bytes()).await?;
-    stdout.write_all(json.as_bytes()).await?;
-    stdout.flush().await?;
+    out.write_all(json.as_bytes()).await?;
+    out.write_all(b"\n").await?;
+    out.flush().await?;
 
     debug!(response = %json, "sent MCP response");
     Ok(())
@@ -973,3 +995,99 @@ fn engine_error_message(err: EngineError) -> String {
 }
 
 // -- Tests --
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// write_message emits exactly one line of JSON terminated by `\n`,
+    /// which read_line_capped reads back and serde parses (round-trip).
+    #[tokio::test]
+    async fn newline_framing_round_trip() {
+        let response = JsonRpcResponse::success(
+            Value::from(7),
+            serde_json::json!({"hello": "world", "n": 42}),
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        write_message(&mut out, &response).await.unwrap();
+
+        // Exactly one trailing newline, no embedded newlines.
+        assert_eq!(out.last(), Some(&b'\n'));
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+
+        let mut reader = out.as_slice();
+        let line = match read_line_capped(&mut reader, MAX_LINE_BYTES).await.unwrap() {
+            ReadLine::Line(l) => l,
+            _ => panic!("expected a line"),
+        };
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 7);
+        assert_eq!(parsed["result"]["hello"], "world");
+        assert_eq!(parsed["result"]["n"], 42);
+
+        // Stream is exhausted afterwards.
+        assert!(matches!(
+            read_line_capped(&mut reader, MAX_LINE_BYTES).await.unwrap(),
+            ReadLine::Eof
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_multiple_and_empty_lines() {
+        let data = b"{\"a\":1}\n\n{\"b\":2}\n";
+        let mut reader = data.as_slice();
+
+        match read_line_capped(&mut reader, 1024).await.unwrap() {
+            ReadLine::Line(l) => assert_eq!(l, "{\"a\":1}"),
+            _ => panic!("expected first line"),
+        }
+        // Empty line is returned as an (empty) line; the stdio loop skips it.
+        match read_line_capped(&mut reader, 1024).await.unwrap() {
+            ReadLine::Line(l) => assert!(l.is_empty()),
+            _ => panic!("expected empty line"),
+        }
+        match read_line_capped(&mut reader, 1024).await.unwrap() {
+            ReadLine::Line(l) => assert_eq!(l, "{\"b\":2}"),
+            _ => panic!("expected second line"),
+        }
+        assert!(matches!(
+            read_line_capped(&mut reader, 1024).await.unwrap(),
+            ReadLine::Eof
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_unterminated_final_line() {
+        let data = b"{\"a\":1}";
+        let mut reader = data.as_slice();
+        match read_line_capped(&mut reader, 1024).await.unwrap() {
+            ReadLine::Line(l) => assert_eq!(l, "{\"a\":1}"),
+            _ => panic!("expected line at EOF without newline"),
+        }
+        assert!(matches!(
+            read_line_capped(&mut reader, 1024).await.unwrap(),
+            ReadLine::Eof
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_rejects_oversized_line_and_recovers() {
+        let mut data = vec![b'x'; 100];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"ok\":true}\n");
+        let mut reader = data.as_slice();
+
+        // First line exceeds the 10-byte cap and is discarded...
+        assert!(matches!(
+            read_line_capped(&mut reader, 10).await.unwrap(),
+            ReadLine::TooLong
+        ));
+        // ...but the next message is still readable.
+        match read_line_capped(&mut reader, 1024).await.unwrap() {
+            ReadLine::Line(l) => assert_eq!(l, "{\"ok\":true}"),
+            _ => panic!("expected line after oversized one"),
+        }
+    }
+}
