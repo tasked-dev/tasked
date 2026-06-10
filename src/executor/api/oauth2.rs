@@ -167,9 +167,7 @@ impl TokenCache {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            {
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
                 warn!(error = %e, path = %path.display(), "failed to set 0600 permissions on token database");
             }
         }
@@ -262,7 +260,13 @@ impl TokenCache {
             "INSERT OR REPLACE INTO oauth_tokens
                  (cache_key, access_token, expires_at, stored_at, refresh_token)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![key, token.access_token, expires_at_str, stored_at, refresh_token],
+            rusqlite::params![
+                key,
+                token.access_token,
+                expires_at_str,
+                stored_at,
+                refresh_token
+            ],
         )
         .map_err(|e| format!("insert: {e}"))?;
         Ok(())

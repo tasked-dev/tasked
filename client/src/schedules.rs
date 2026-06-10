@@ -38,11 +38,7 @@ impl ScheduleResponse {
     /// body and falling back to `fallback` (e.g. the flow definition that was
     /// submitted in a create/update request) when the server omits it.
     fn into_schedule(mut self, fallback: Option<FlowDef>) -> Result<Schedule, TaskedError> {
-        let flow_def = self
-            .flow_def
-            .take()
-            .or(fallback)
-            .unwrap_or_default();
+        let flow_def = self.flow_def.take().or(fallback).unwrap_or_default();
         Ok(Schedule {
             id: ScheduleId::from(self.id),
             queue_id: QueueId::from(self.queue_id),
@@ -79,9 +75,7 @@ impl TaskedClient {
             name: schedule_def.name,
             enabled: schedule_def.enabled,
         };
-        let body: ScheduleResponse = self
-            .request_json(self.client.post(&url).json(&req))
-            .await?;
+        let body: ScheduleResponse = self.request_json(self.client.post(&url).json(&req)).await?;
         body.into_schedule(Some(schedule_def.flow))
     }
 
@@ -137,9 +131,7 @@ impl TaskedClient {
             name: schedule_def.name,
             enabled: schedule_def.enabled,
         };
-        let body: ScheduleResponse = self
-            .request_json(self.client.put(&url).json(&req))
-            .await?;
+        let body: ScheduleResponse = self.request_json(self.client.put(&url).json(&req)).await?;
         body.into_schedule(Some(schedule_def.flow))
     }
 

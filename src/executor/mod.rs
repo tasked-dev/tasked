@@ -360,7 +360,7 @@ mod tests {
     fn truncate_body_respects_char_boundaries() {
         // Multi-byte char straddling the cap must not cause a panic.
         let mut body = "x".repeat(MAX_ERROR_BODY_BYTES - 1);
-        body.push_str("é"); // 2 bytes, crosses the boundary
+        body.push('é'); // 2 bytes, crosses the boundary
         body.push_str(&"y".repeat(100));
         let out = truncate_body_for_error(&body);
         assert!(out.contains("[truncated"));

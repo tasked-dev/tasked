@@ -12,10 +12,7 @@ use tasked::store::memory::MemoryStorage;
 async fn cancel_flow_aborts_running_delay_executor() {
     let engine = Arc::new(
         Engine::builder(Arc::new(MemoryStorage::new()))
-            .executor(
-                "delay",
-                Arc::new(tasked::executor::delay::DelayExecutor),
-            )
+            .executor("delay", Arc::new(tasked::executor::delay::DelayExecutor))
             .build(),
     );
     let queue_id = QueueId::from("q");

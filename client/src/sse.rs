@@ -372,9 +372,6 @@ mod tests {
         chunk.extend_from_slice(b"\n\n");
         let results = p.push(&chunk);
         assert_eq!(results.len(), 1);
-        assert!(matches!(
-            results[0],
-            Err(TaskedError::InvalidResponse(_))
-        ));
+        assert!(matches!(results[0], Err(TaskedError::InvalidResponse(_))));
     }
 }

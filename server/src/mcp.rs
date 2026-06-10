@@ -383,7 +383,10 @@ async fn stdio_loop(engine: Arc<Engine>) -> Result<(), Box<dyn std::error::Error
                 return Ok(());
             }
             ReadLine::TooLong => {
-                warn!(max_bytes = MAX_LINE_BYTES, "MCP message exceeds size limit, discarding");
+                warn!(
+                    max_bytes = MAX_LINE_BYTES,
+                    "MCP message exceeds size limit, discarding"
+                );
                 let response = JsonRpcResponse::error(
                     Value::Null,
                     PARSE_ERROR,

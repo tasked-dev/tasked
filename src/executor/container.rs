@@ -357,7 +357,11 @@ impl Executor for ContainerExecutor {
         };
 
         // Resource limits — task overrides are bounded by executor-level caps.
-        let memory = match task.executor_config.get("memory_mb").and_then(|v| v.as_u64()) {
+        let memory = match task
+            .executor_config
+            .get("memory_mb")
+            .and_then(|v| v.as_u64())
+        {
             None => DEFAULT_MEMORY_BYTES,
             Some(mb) => {
                 if mb == 0 || mb > self.max_memory_mb {
@@ -391,7 +395,11 @@ impl Executor for ContainerExecutor {
             }
         };
 
-        let pids_limit = match task.executor_config.get("pids_limit").and_then(|v| v.as_i64()) {
+        let pids_limit = match task
+            .executor_config
+            .get("pids_limit")
+            .and_then(|v| v.as_i64())
+        {
             None => DEFAULT_PIDS_LIMIT,
             Some(pids) => {
                 // Negative/zero would mean "unlimited" to Docker — reject.
@@ -524,7 +532,10 @@ mod tests {
         match result {
             ExecuteResult::Failed { error, retryable } => {
                 assert!(!retryable, "policy failures must be non-retryable");
-                assert!(error.contains(needle), "error '{error}' should mention '{needle}'");
+                assert!(
+                    error.contains(needle),
+                    "error '{error}' should mention '{needle}'"
+                );
             }
             other => panic!("expected non-retryable failure, got {other:?}"),
         }

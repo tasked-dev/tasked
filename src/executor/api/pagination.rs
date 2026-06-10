@@ -433,7 +433,8 @@ mod tests {
 
     #[test]
     fn parse_link_next_extracts_next_url() {
-        let header = r#"<https://api.example.com/p2>; rel="next", <https://api.example.com/p1>; rel="prev""#;
+        let header =
+            r#"<https://api.example.com/p2>; rel="next", <https://api.example.com/p1>; rel="prev""#;
         assert_eq!(
             parse_link_next(header).as_deref(),
             Some("https://api.example.com/p2")

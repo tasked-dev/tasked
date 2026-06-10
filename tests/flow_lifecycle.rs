@@ -41,7 +41,10 @@ async fn engine_with_flow() -> (Arc<Engine>, Flow) {
         .create_queue(&queue_id, QueueConfig::default())
         .await
         .unwrap();
-    let flow = engine.submit_flow(&queue_id, two_root_flow()).await.unwrap();
+    let flow = engine
+        .submit_flow(&queue_id, two_root_flow())
+        .await
+        .unwrap();
     (engine, flow)
 }
 

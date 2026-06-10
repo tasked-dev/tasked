@@ -211,13 +211,7 @@ async fn crc_corruption_truncates_and_allows_new_writes() {
     {
         let store = JournaledStorage::open(config_for(dir.path())).unwrap();
         assert!(store.get_queue(&qid).await.unwrap().is_some());
-        assert!(
-            store
-                .get_flow(&FlowId::from("f1"))
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store.get_flow(&FlowId::from("f1")).await.unwrap().is_some());
         assert!(
             store.get_flow(&FlowId::from("f2")).await.unwrap().is_none(),
             "the corrupted event must not be applied"
@@ -236,20 +230,10 @@ async fn crc_corruption_truncates_and_allows_new_writes() {
     // Second recovery sees the post-corruption write.
     {
         let store = JournaledStorage::open(config_for(dir.path())).unwrap();
-        assert!(
-            store
-                .get_flow(&FlowId::from("f1"))
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store.get_flow(&FlowId::from("f1")).await.unwrap().is_some());
         assert!(store.get_flow(&FlowId::from("f2")).await.unwrap().is_none());
         assert!(
-            store
-                .get_flow(&FlowId::from("f3"))
-                .await
-                .unwrap()
-                .is_some(),
+            store.get_flow(&FlowId::from("f3")).await.unwrap().is_some(),
             "write made after truncation must survive a second recovery"
         );
     }

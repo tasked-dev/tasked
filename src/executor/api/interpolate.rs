@@ -252,7 +252,10 @@ mod tests {
         assert_eq!(path, "/files/a%20b");
         // A bare '%' that is not a valid escape IS encoded.
         let ctx = ctx_with(&[("name", json!("50%"))]);
-        assert_eq!(interpolate_path("/files/${params.name}", &ctx), "/files/50%25");
+        assert_eq!(
+            interpolate_path("/files/${params.name}", &ctx),
+            "/files/50%25"
+        );
     }
 
     #[test]
@@ -266,10 +269,7 @@ mod tests {
     fn interpolate_resolves_params_and_credential_paths() {
         let mut ctx = ctx_with(&[("obj", json!({"inner": [1, 2, 3]}))]);
         ctx.credential = Some(json!({"token": "secret"}));
-        assert_eq!(
-            interpolate(&json!("${params.obj.inner.1}"), &ctx),
-            json!(2)
-        );
+        assert_eq!(interpolate(&json!("${params.obj.inner.1}"), &ctx), json!(2));
         assert_eq!(
             interpolate(&json!("${credential.token}"), &ctx),
             json!("secret")

@@ -48,7 +48,8 @@ fn task_state_from_str(idx: usize, s: &str) -> Result<TaskState, rusqlite::Error
 }
 
 pub(crate) fn parse_task_state(s: &str) -> Result<TaskState, StorageError> {
-    task_state_from_str(0, s).map_err(|_| StorageError::Internal(format!("unknown task state: {s}")))
+    task_state_from_str(0, s)
+        .map_err(|_| StorageError::Internal(format!("unknown task state: {s}")))
 }
 
 pub(crate) fn row_to_queue(row: &rusqlite::Row<'_>) -> Result<Queue, rusqlite::Error> {

@@ -77,7 +77,9 @@ impl Storage for MemoryStorage {
         inner.flows.retain(|_, f| f.queue_id != *id);
         inner.tasks.retain(|_, t| t.queue_id != *id);
         inner.deps.retain(|(_, fid), _| !flow_ids.contains(fid));
-        inner.dependents.retain(|(_, fid), _| !flow_ids.contains(fid));
+        inner
+            .dependents
+            .retain(|(_, fid), _| !flow_ids.contains(fid));
         inner.schedules.retain(|_, s| s.queue_id != *id);
         Ok(())
     }

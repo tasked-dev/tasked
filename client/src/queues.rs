@@ -41,9 +41,7 @@ impl TaskedClient {
             id: id.to_string(),
             config,
         };
-        let body: QueueResponse = self
-            .request_json(self.client.post(&url).json(&req))
-            .await?;
+        let body: QueueResponse = self.request_json(self.client.post(&url).json(&req)).await?;
         body.into_queue()
     }
 

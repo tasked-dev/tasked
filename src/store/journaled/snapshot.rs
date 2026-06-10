@@ -64,9 +64,7 @@ pub(crate) fn write_snapshot(
         match std::fs::File::open(parent) {
             Ok(dir) => {
                 if let Err(e) = dir.sync_all() {
-                    return Err(StorageError::Internal(format!(
-                        "snapshot dir fsync: {e}"
-                    )));
+                    return Err(StorageError::Internal(format!("snapshot dir fsync: {e}")));
                 }
             }
             Err(e) => {

@@ -120,7 +120,7 @@ pub fn allow_loopback_for_tests(allow: bool) {
 /// Check a URL's host without DNS: returns `Ok(Some(()))` if the host is an
 /// IP literal that passed validation, `Ok(None)` if it is a hostname that
 /// still needs resolving, or `Err` if it is a blocked IP literal.
-fn validate_url_pre_dns<'a>(url: &'a str) -> Result<Option<&'a str>, String> {
+fn validate_url_pre_dns(url: &str) -> Result<Option<&str>, String> {
     let host = extract_host(url).ok_or_else(|| format!("cannot parse host from URL: {url}"))?;
 
     // If the host is a raw IP, check it directly

@@ -166,7 +166,8 @@ impl MemState {
         self.ready_index.remove(queue_id);
 
         self.deps.retain(|(_, fid), _| !flow_ids.contains(fid));
-        self.dependents.retain(|(_, fid), _| !flow_ids.contains(fid));
+        self.dependents
+            .retain(|(_, fid), _| !flow_ids.contains(fid));
         self.schedules.retain(|_, s| s.queue_id != *queue_id);
     }
 

@@ -50,10 +50,7 @@ const INSERT_TASK_SQL: &str = "INSERT INTO tasks (id, flow_id, queue_id, state, 
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)";
 
 /// Serialize and insert a single task via a prepared INSERT statement.
-fn insert_task(
-    stmt: &mut rusqlite::CachedStatement<'_>,
-    task: &Task,
-) -> Result<(), StorageError> {
+fn insert_task(stmt: &mut rusqlite::CachedStatement<'_>, task: &Task) -> Result<(), StorageError> {
     let executor_config_json = serde_json::to_string(&task.executor_config)?;
     let input_json = task.input.as_ref().map(serde_json::to_string).transpose()?;
     let output_json = task
@@ -608,10 +605,8 @@ impl Storage for SqliteStorage {
         if tasks.is_empty() {
             return Ok(vec![]);
         }
-        let tasks: Vec<(TaskId, FlowId)> = tasks
-            .iter()
-            .map(|&(t, f)| (t.clone(), f.clone()))
-            .collect();
+        let tasks: Vec<(TaskId, FlowId)> =
+            tasks.iter().map(|&(t, f)| (t.clone(), f.clone())).collect();
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let now = Utc::now().to_rfc3339();

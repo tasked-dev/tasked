@@ -85,7 +85,10 @@ async fn run_suite(store: Arc<dyn Storage>) {
     let qid = QueueId::from("conformance-q");
 
     // ---- Queue CRUD ----
-    store.create_queue(&mk_queue("conformance-q")).await.unwrap();
+    store
+        .create_queue(&mk_queue("conformance-q"))
+        .await
+        .unwrap();
     let err = store
         .create_queue(&mk_queue("conformance-q"))
         .await
@@ -111,7 +114,10 @@ async fn run_suite(store: Arc<dyn Storage>) {
     let t_c = mk_task(&qid, &f1, "c", TaskState::Pending);
     let mut deps: HashMap<TaskId, Vec<TaskId>> = HashMap::new();
     deps.insert(TaskId::from("b"), vec![TaskId::from("a")]);
-    deps.insert(TaskId::from("c"), vec![TaskId::from("a"), TaskId::from("b")]);
+    deps.insert(
+        TaskId::from("c"),
+        vec![TaskId::from("a"), TaskId::from("b")],
+    );
     store
         .create_flow(&mk_flow(&qid, "flow-1", 3), &[t_a, t_b, t_c], &deps)
         .await
@@ -472,7 +478,10 @@ async fn run_suite(store: Arc<dyn Storage>) {
         .create_flow(&child, &[], &HashMap::new())
         .await
         .unwrap();
-    assert_eq!(store.get_child_flow_ids(&f3).await.unwrap(), vec![f4.clone()]);
+    assert_eq!(
+        store.get_child_flow_ids(&f3).await.unwrap(),
+        vec![f4.clone()]
+    );
 
     // ---- delete_terminal_flows_before ----
     store

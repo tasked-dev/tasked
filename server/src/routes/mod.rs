@@ -195,7 +195,10 @@ pub(crate) fn build_router(engine: Arc<Engine>, cors_origins: &[String]) -> Rout
             get(flows::get_flow).delete(flows::cancel_flow),
         )
         // Flow export
-        .route("/api/v1/flows/{fid}/export", get(flows::export_flow_handler))
+        .route(
+            "/api/v1/flows/{fid}/export",
+            get(flows::export_flow_handler),
+        )
         // Flow SSE events
         .route("/api/v1/flows/{fid}/events", get(sse::flow_events))
         // Task ack

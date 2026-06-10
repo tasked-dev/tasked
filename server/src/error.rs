@@ -39,10 +39,7 @@ fn task_limit_exceeded_msg(max: impl std::fmt::Display) -> String {
     format!("Flow task limit ({max}) exceeded")
 }
 
-fn flow_limit_exceeded_msg(
-    queue: impl std::fmt::Display,
-    max: impl std::fmt::Display,
-) -> String {
+fn flow_limit_exceeded_msg(queue: impl std::fmt::Display, max: impl std::fmt::Display) -> String {
     format!("Queue '{queue}' has reached its pending flow limit ({max})")
 }
 
@@ -169,10 +166,9 @@ impl From<EngineError> for ApiError {
                 ApiError::bad_request("invalid_cron_expression", msg.clone())
             }
             EngineError::Spawn(msg) => ApiError::bad_request("spawn_error", msg.clone()),
-            EngineError::TriggerDepthExceeded(max) => ApiError::bad_request(
-                "trigger_depth_exceeded",
-                trigger_depth_exceeded_msg(max),
-            ),
+            EngineError::TriggerDepthExceeded(max) => {
+                ApiError::bad_request("trigger_depth_exceeded", trigger_depth_exceeded_msg(max))
+            }
             EngineError::TaskLimitExceeded(max) => {
                 ApiError::bad_request("task_limit_exceeded", task_limit_exceeded_msg(max))
             }

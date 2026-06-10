@@ -89,7 +89,10 @@ impl ShardedStorage {
     ///
     /// Opening (file creation + schema init) is blocking I/O, so it runs on
     /// the tokio blocking pool.
-    async fn get_or_open_shard(&self, queue_id: &QueueId) -> Result<Arc<SqliteStorage>, StorageError> {
+    async fn get_or_open_shard(
+        &self,
+        queue_id: &QueueId,
+    ) -> Result<Arc<SqliteStorage>, StorageError> {
         // Fast path: read lock
         {
             let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
@@ -294,10 +297,7 @@ impl Storage for ShardedStorage {
         self.catalog
             .with_conn(move |conn| {
                 conn.execute("DELETE FROM flow_map WHERE queue_id = ?1", params![qid])?;
-                conn.execute(
-                    "DELETE FROM schedule_map WHERE queue_id = ?1",
-                    params![qid],
-                )?;
+                conn.execute("DELETE FROM schedule_map WHERE queue_id = ?1", params![qid])?;
                 Ok(())
             })
             .await?;
@@ -351,7 +351,10 @@ impl Storage for ShardedStorage {
         // committed flow that no lookup could ever resolve.
         let fid = flow.id.as_str().to_owned();
         let qid = flow.queue_id.as_str().to_owned();
-        let parent = flow.parent_flow_id.as_ref().map(|id| id.as_str().to_owned());
+        let parent = flow
+            .parent_flow_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned());
         self.catalog
             .with_conn(move |conn| {
                 conn.execute(
@@ -700,8 +703,7 @@ impl Storage for ShardedStorage {
         if deleted > 0 {
             // Collect remaining flow IDs from the shard.
             let remaining = shard.list_flows(queue_id, None).await?;
-            let remaining_ids: Vec<String> =
-                remaining.iter().map(|f| f.id.to_string()).collect();
+            let remaining_ids: Vec<String> = remaining.iter().map(|f| f.id.to_string()).collect();
 
             // Evict deleted flows from in-memory cache.
             {
