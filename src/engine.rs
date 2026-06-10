@@ -299,8 +299,9 @@ pub struct Engine {
     active_queues: std::sync::Mutex<ActiveQueues>,
     /// Optional artifact storage backend.
     artifacts: Option<Arc<dyn ArtifactStore>>,
-    /// Cache of flow_id → trigger_depth. Trigger depth never changes during a flow's
-    /// lifecycle, so this is safe to cache permanently (entries evicted on flow deletion).
+    /// Cache of flow_id → trigger_depth. Trigger depth never changes during a
+    /// flow's lifecycle; entries are evicted when the flow reaches a terminal
+    /// state (see `evict_flow_caches`).
     trigger_depth_cache: std::sync::Mutex<HashMap<FlowId, u32>>,
     /// Cache of queue_id → QueueConfig. Invalidated on queue update/delete.
     queue_config_cache: std::sync::Mutex<HashMap<QueueId, QueueConfig>>,
@@ -554,29 +555,33 @@ impl Engine {
 
     /// Promote delayed tasks and wake the specific queue workers that have newly-ready work.
     async fn promote_delayed_tasks_and_wake(&self) -> Result<(), EngineError> {
-        if self
-            .delayed_task_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
-        {
-            return Ok(());
-        }
-        let delayed = self.store.fetch_delayed_tasks_due().await?;
-        let mut woken_queues = HashSet::new();
-        for task in &delayed {
-            debug!(task_id = %task.id, flow_id = %task.flow_id, "promoting delayed task to ready");
-            self.store
-                .update_task_state(&task.id, &task.flow_id, TaskState::Ready)
-                .await?;
-            woken_queues.insert(task.queue_id.clone());
-        }
-        self.delayed_task_count
-            .fetch_sub(delayed.len(), std::sync::atomic::Ordering::Relaxed);
-        // Wake the specific queue workers that have newly-ready tasks
+        let woken_queues = self.promote_delayed_tasks().await?;
         for qid in &woken_queues {
             self.notify_queue(qid);
         }
         Ok(())
+    }
+
+    /// Saturating decrement of the delayed-task counter. The counter is an
+    /// optimization (skip the DB query when zero), so it must never wrap:
+    /// concurrent promoters and cancellations make exact accounting racy.
+    fn dec_delayed_count(&self, by: usize) {
+        let _ = self
+            .delayed_task_count
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| Some(v.saturating_sub(by)),
+            );
+    }
+
+    /// Bookkeeping for a task leaving a non-terminal state via cancellation:
+    /// a task cancelled out of Delayed will never be seen by
+    /// promote_delayed_tasks, so decrement the counter here.
+    fn note_task_cancelled(&self, prev_state: TaskState) {
+        if prev_state == TaskState::Delayed {
+            self.dec_delayed_count(1);
+        }
     }
 
     /// Ensure a semaphore exists for the given queue. Returns it.
@@ -681,6 +686,16 @@ impl Engine {
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
         self.active_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        // Drop the concurrency/rate-limit state: a queue recreated with the
+        // same ID must get limits from its new config, not stale ones.
+        self.semaphores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.rate_limiters
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
@@ -934,14 +949,15 @@ impl Engine {
                 self.store
                     .update_task_state(&task.id, flow_id, TaskState::Cancelled)
                     .await?;
+                self.note_task_cancelled(task.state);
             }
         }
         self.store
             .update_flow_state(flow_id, FlowState::Cancelled)
             .await?;
 
-        // Evict dep graph — flow is terminal
-        self.evict_dep_graph(flow_id);
+        // Evict per-flow caches — flow is terminal
+        self.evict_flow_caches(flow_id);
 
         // Propagate cancellation to child flows spawned by trigger tasks
         self.cancel_child_flows(flow_id).await;
@@ -1271,25 +1287,42 @@ impl Engine {
     }
 
     /// Promote delayed tasks whose retry_at has passed back to Ready.
-    async fn promote_delayed_tasks(&self) -> Result<(), EngineError> {
+    /// Returns the queues that received newly-ready tasks.
+    ///
+    /// The sweeper and process_cycle can both fetch the same due tasks
+    /// (fetching is not a claiming operation), so a concurrent promoter
+    /// winning the Delayed→Ready transition is expected: count only our own
+    /// successful promotions and skip InvalidStateTransition.
+    async fn promote_delayed_tasks(&self) -> Result<HashSet<QueueId>, EngineError> {
         // Skip the DB query entirely when no tasks are delayed.
         if self
             .delayed_task_count
             .load(std::sync::atomic::Ordering::Relaxed)
             == 0
         {
-            return Ok(());
+            return Ok(HashSet::new());
         }
         let delayed = self.store.fetch_delayed_tasks_due().await?;
+        let mut woken_queues = HashSet::new();
+        let mut promoted = 0usize;
         for task in &delayed {
-            debug!(task_id = %task.id, flow_id = %task.flow_id, "promoting delayed task to ready");
-            self.store
+            match self
+                .store
                 .update_task_state(&task.id, &task.flow_id, TaskState::Ready)
-                .await?;
+                .await
+            {
+                Ok(()) => {
+                    debug!(task_id = %task.id, flow_id = %task.flow_id, "promoting delayed task to ready");
+                    promoted += 1;
+                    woken_queues.insert(task.queue_id.clone());
+                }
+                // A concurrent promoter or cancellation got there first.
+                Err(StorageError::InvalidStateTransition(_, _)) => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
-        self.delayed_task_count
-            .fetch_sub(delayed.len(), std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        self.dec_delayed_count(promoted);
+        Ok(woken_queues)
     }
 
     /// Deactivate a queue if it has no more running flows.
@@ -2251,6 +2284,7 @@ impl Engine {
                                 self.store
                                     .update_task_state(&t.id, &task.flow_id, TaskState::Cancelled)
                                     .await?;
+                                self.note_task_cancelled(t.state);
 
                                 metrics::counter!(
                                     "tasked_tasks_completed_total",
@@ -2373,6 +2407,7 @@ impl Engine {
                                 self.store
                                     .update_task_state(&ft.id, &task.flow_id, TaskState::Cancelled)
                                     .await?;
+                                self.note_task_cancelled(ft.state);
 
                                 metrics::counter!(
                                     "tasked_tasks_completed_total",
@@ -2818,6 +2853,7 @@ impl Engine {
                 self.store
                     .update_task_state(&dep_id, flow_id, TaskState::Cancelled)
                     .await?;
+                self.note_task_cancelled(task.state);
 
                 metrics::counter!(
                     "tasked_tasks_completed_total",
