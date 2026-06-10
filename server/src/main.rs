@@ -65,13 +65,20 @@ enum Commands {
         #[arg(long, default_value_t = 8080)]
         port: u16,
 
-        /// Host to bind to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind to (defaults to loopback only; binding a non-loopback
+        /// address with --auth-mode=none requires --allow-unauthenticated)
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
         /// Authentication mode: none, api-key
         #[arg(long, default_value = "none")]
         auth_mode: String,
+
+        /// Allow starting with --auth-mode=none on a non-loopback host.
+        /// DANGEROUS: anyone who can reach the address can submit flows and
+        /// execute shell commands. Prefer --auth-mode=api-key.
+        #[arg(long)]
+        allow_unauthenticated: bool,
 
         /// API key for api-key auth mode
         #[arg(long, env = "TASKED_API_KEY")]
@@ -288,6 +295,10 @@ struct AckRequest {
     retryable: Option<bool>,
     #[serde(default)]
     approved_by: Option<String>,
+    /// Approval verification code. Required when acking an approval task
+    /// whose output contains a `code` field.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -344,6 +355,7 @@ struct ErrorResponse {
 enum ApiError {
     NotFound { error: String, message: String },
     BadRequest { error: String, message: String },
+    Forbidden { error: String, message: String },
     Conflict { error: String, message: String },
     Internal { error: String, message: String },
     ServiceUnavailable { error: String, message: String },
@@ -358,6 +370,9 @@ impl IntoResponse for ApiError {
             }
             ApiError::BadRequest { error, message } => {
                 (StatusCode::BAD_REQUEST, ErrorResponse { error, message })
+            }
+            ApiError::Forbidden { error, message } => {
+                (StatusCode::FORBIDDEN, ErrorResponse { error, message })
             }
             ApiError::Conflict { error, message } => {
                 (StatusCode::CONFLICT, ErrorResponse { error, message })
@@ -423,10 +438,13 @@ impl From<EngineError> for ApiError {
                 message: msg.clone(),
             },
             EngineError::Storage(e) => map_storage_error(e),
-            EngineError::Export(msg) => ApiError::Internal {
-                error: "export_failed".to_string(),
-                message: msg.clone(),
-            },
+            EngineError::Export(msg) => {
+                tracing::error!(error = %msg, "flow export failed");
+                ApiError::Internal {
+                    error: "export_failed".to_string(),
+                    message: "internal error".to_string(),
+                }
+            }
         }
     }
 }
@@ -458,10 +476,14 @@ fn map_storage_error(err: &tasked::store::StorageError) -> ApiError {
             error: "schedule_not_found".to_string(),
             message: format!("Schedule '{id}' not found"),
         },
-        StorageError::Internal(msg) => ApiError::Internal {
-            error: "internal_error".to_string(),
-            message: msg.clone(),
-        },
+        StorageError::Internal(msg) => {
+            // Log the detail server-side; never echo internal errors to clients.
+            tracing::error!(error = %msg, "internal storage error");
+            ApiError::Internal {
+                error: "internal_error".to_string(),
+                message: "internal error".to_string(),
+            }
+        }
     }
 }
 
@@ -609,6 +631,27 @@ async fn ack_task(
             error: "task_not_found".to_string(),
             message: not_found_msg,
         })?;
+
+    // If the task is awaiting approval and its output carries a verification
+    // code, the ack must supply the matching code. Tasks without a code
+    // (older approval outputs, callback/remote tasks) are accepted as before.
+    if let Some(expected) = task
+        .output
+        .as_ref()
+        .filter(|o| o.get("awaiting_approval").and_then(|v| v.as_bool()) == Some(true))
+        .and_then(|o| o.get("code"))
+        .and_then(|v| v.as_str())
+    {
+        let supplied = req.code.as_deref().unwrap_or("");
+        if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+            return Err(ApiError::Forbidden {
+                error: "invalid_approval_code".to_string(),
+                message: "This task requires an approval code: pass the 'code' value from \
+                          the task output in the ack request body"
+                    .to_string(),
+            });
+        }
+    }
 
     // Merge approval metadata into output if provided
     let output = match (&req.approved_by, req.output) {
@@ -776,9 +819,10 @@ async fn flow_events(
             let tasks = match engine.get_flow_tasks(&flow_id).await {
                 Ok(tasks) => tasks,
                 Err(e) => {
+                    tracing::error!(error = %e, flow_id = %flow_id, "engine error in SSE stream");
                     let error_data = serde_json::json!({
                         "error": "engine_error",
-                        "message": e.to_string(),
+                        "message": "internal error",
                     });
                     if let Ok(data) = serde_json::to_string(&error_data) {
                         yield Ok(Event::default().event("error").data(data));
@@ -842,9 +886,10 @@ async fn flow_events(
                     break;
                 }
                 Err(e) => {
+                    tracing::error!(error = %e, flow_id = %flow_id, "engine error in SSE stream");
                     let error_data = serde_json::json!({
                         "error": "engine_error",
-                        "message": e.to_string(),
+                        "message": "internal error",
                     });
                     if let Ok(data) = serde_json::to_string(&error_data) {
                         yield Ok(Event::default().event("error").data(data));
@@ -897,9 +942,18 @@ async fn upload_artifact(
     artifacts
         .upload(&flow_id, &name, &body)
         .await
-        .map_err(|e| ApiError::Internal {
-            error: "artifact_upload_failed".to_string(),
-            message: e.to_string(),
+        .map_err(|e| match &e {
+            tasked::artifacts::ArtifactError::InvalidName(_) => ApiError::BadRequest {
+                error: "invalid_artifact_name".to_string(),
+                message: e.to_string(),
+            },
+            _ => {
+                tracing::error!(error = %e, "artifact upload failed");
+                ApiError::Internal {
+                    error: "artifact_upload_failed".to_string(),
+                    message: "internal error".to_string(),
+                }
+            }
         })?;
 
     Ok(StatusCode::CREATED)
@@ -927,14 +981,17 @@ async fn download_artifact(
                     message: e.to_string(),
                 }
             }
-            tasked::artifacts::ArtifactError::InvalidName(_) => ApiError::NotFound {
-                error: "artifact_not_found".to_string(),
+            tasked::artifacts::ArtifactError::InvalidName(_) => ApiError::BadRequest {
+                error: "invalid_artifact_name".to_string(),
                 message: e.to_string(),
             },
-            _ => ApiError::Internal {
-                error: "artifact_download_failed".to_string(),
-                message: e.to_string(),
-            },
+            _ => {
+                tracing::error!(error = %e, "artifact download failed");
+                ApiError::Internal {
+                    error: "artifact_download_failed".to_string(),
+                    message: "internal error".to_string(),
+                }
+            }
         })?;
 
     Ok((
@@ -956,9 +1013,12 @@ async fn list_artifacts(
     let names = artifacts
         .list(&flow_id)
         .await
-        .map_err(|e| ApiError::Internal {
-            error: "artifact_list_failed".to_string(),
-            message: e.to_string(),
+        .map_err(|e| {
+            tracing::error!(error = %e, "artifact list failed");
+            ApiError::Internal {
+                error: "artifact_list_failed".to_string(),
+                message: "internal error".to_string(),
+            }
         })?;
 
     Ok(Json(names))
@@ -981,11 +1041,30 @@ fn map_export_error(e: EngineError, not_found_msg: String) -> ApiError {
             error: "flow_not_found".to_string(),
             message: not_found_msg,
         },
-        _ => ApiError::Internal {
-            error: "export_failed".to_string(),
-            message: e.to_string(),
-        },
+        _ => {
+            tracing::error!(error = %e, "flow export failed");
+            ApiError::Internal {
+                error: "export_failed".to_string(),
+                message: "internal error".to_string(),
+            }
+        }
     }
+}
+
+/// Sanitize a string for safe use as a filename inside an HTTP header.
+/// Only `[A-Za-z0-9._-]` are kept; every other character becomes `_`.
+/// This prevents header injection (e.g. CR/LF) via percent-decoded path
+/// segments embedded in `content-disposition`.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 async fn export_flow_handler(
@@ -1003,15 +1082,22 @@ async fn export_flow_handler(
                 .export_flow_tar(&flow_id)
                 .await
                 .map_err(|e| map_export_error(e, not_found_msg))?;
-            Ok(axum::response::Response::builder()
+            let filename = sanitize_filename(flow_id.as_str());
+            axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/gzip")
                 .header(
                     "content-disposition",
-                    format!("attachment; filename=\"{}.tar.gz\"", flow_id.as_str()),
+                    format!("attachment; filename=\"{filename}.tar.gz\""),
                 )
                 .body(Body::from(tar_bytes))
-                .unwrap())
+                .map_err(|e| {
+                    tracing::error!(error = %e, "failed to build tar export response");
+                    ApiError::Internal {
+                        error: "internal_error".to_string(),
+                        message: "internal error".to_string(),
+                    }
+                })
         }
         "json" => {
             let export = engine
@@ -1227,6 +1313,19 @@ fn register_executors(
     }
 }
 
+/// Returns true if `host` refers to a loopback address. Unresolvable
+/// hostnames are conservatively treated as non-loopback.
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// Constant-time byte comparison to prevent timing attacks on API key validation.
 /// Uses `subtle::ConstantTimeEq` which does not short-circuit on length mismatch.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1237,13 +1336,26 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn add_auth_layer(app: Router, auth_mode: &str, api_key: Option<&str>) -> Router {
     match auth_mode {
         "api-key" => {
-            let key = api_key
-                .expect("--api-key required when --auth-mode=api-key")
-                .to_string();
+            let key = match api_key {
+                Some(k) => k.to_string(),
+                None => {
+                    eprintln!(
+                        "fatal: --api-key (or TASKED_API_KEY) is required when --auth-mode=api-key"
+                    );
+                    std::process::exit(1);
+                }
+            };
             app.layer(axum::middleware::from_fn(
                 move |req: Request<Body>, next: Next| {
                     let key = key.clone();
                     async move {
+                        // Exempt liveness and metrics probes from API-key auth so
+                        // load balancers and scrapers can reach them without
+                        // credentials. Neither endpoint exposes flow data.
+                        let path = req.uri().path();
+                        if path == "/healthz" || path == "/metrics" {
+                            return next.run(req).await;
+                        }
                         let auth_header = req.headers().get("authorization");
                         let expected = format!("Bearer {key}");
                         match auth_header.and_then(|v| v.to_str().ok()) {
@@ -1283,6 +1395,7 @@ async fn main() {
             port,
             host,
             auth_mode,
+            allow_unauthenticated,
             api_key,
             metrics_push_url,
             metrics_port,
@@ -1306,6 +1419,7 @@ async fn main() {
                 port,
                 host,
                 auth_mode,
+                allow_unauthenticated,
                 api_key,
                 metrics_push_url,
                 metrics_port,
@@ -1424,6 +1538,7 @@ async fn run_serve(
     port: u16,
     host: String,
     auth_mode: String,
+    allow_unauthenticated: bool,
     api_key: Option<String>,
     metrics_push_url: Option<String>,
     metrics_port: Option<u16>,
@@ -1500,13 +1615,23 @@ async fn run_serve(
     // Clone for the engine loop — spawned after listener binds (see below).
     let engine_handle = engine.clone();
 
-    // Warn if running without authentication on a non-localhost address
-    if auth_mode == "none" && host != "127.0.0.1" && host != "localhost" && host != "::1" {
+    // Refuse to serve unauthenticated on a non-loopback address unless the
+    // operator explicitly opts in. The shell executor is registered, so an
+    // unauthenticated reachable server is remote command execution.
+    if auth_mode == "none" && !is_loopback_host(&host) {
+        if !allow_unauthenticated {
+            eprintln!(
+                "fatal: refusing to start with --auth-mode=none on non-loopback host '{host}'. \
+                 Anyone who can reach this address could submit flows and execute shell commands. \
+                 Use --auth-mode=api-key, bind to 127.0.0.1, or pass --allow-unauthenticated to override."
+            );
+            std::process::exit(1);
+        }
         tracing::warn!(
             host = %host,
-            "server starting with NO authentication on a non-localhost address — \
-             anyone who can reach this address can submit flows and execute commands. \
-             Use --auth-mode=api-key for production deployments."
+            "server starting with NO authentication on a non-localhost address \
+             (--allow-unauthenticated) — anyone who can reach this address can submit \
+             flows and execute commands. Use --auth-mode=api-key for production deployments."
         );
     }
 
@@ -1515,12 +1640,11 @@ async fn run_serve(
     let app = if metrics_port.is_some() {
         build_router(engine, &cors_origins)
     } else {
-        if auth_mode == "none" {
-            tracing::warn!(
-                "metrics endpoint (/metrics) is unauthenticated because --auth-mode=none. \
-                 Use --metrics-port to serve metrics on a separate listener."
-            );
-        }
+        tracing::warn!(
+            "metrics endpoint (/metrics) on the main listener is exempt from authentication \
+             so scrapers can reach it. Use --metrics-port to serve metrics on a separate \
+             loopback-only listener instead."
+        );
         build_router_with_metrics(engine, metrics_handle.clone(), &cors_origins)
     };
 
@@ -1586,7 +1710,44 @@ async fn run_serve(
         engine_handle.run().await;
     });
 
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
+
+    info!("server shut down gracefully");
+}
+
+/// Resolves when the process receives SIGTERM or ctrl-c (SIGINT),
+/// triggering graceful shutdown of in-flight HTTP requests.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to install ctrl-c handler");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received ctrl-c, shutting down"),
+        _ = terminate => info!("received SIGTERM, shutting down"),
+    }
 }
 
 async fn run_flow(
@@ -1977,3 +2138,55 @@ async fn run_flow(
 }
 
 // -- Tests --
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_filename_keeps_safe_chars() {
+        assert_eq!(sanitize_filename("flow-123_v2.tar"), "flow-123_v2.tar");
+        assert_eq!(
+            sanitize_filename("AZaz09._-"),
+            "AZaz09._-",
+            "all allowed classes pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_header_injection_chars() {
+        // %0A / %0D decoded into the path must not survive into headers.
+        assert_eq!(sanitize_filename("abc\r\ndef"), "abc__def");
+        assert_eq!(sanitize_filename("a\"b"), "a_b");
+        assert_eq!(sanitize_filename("a/b\\c d"), "a_b_c_d");
+        assert_eq!(sanitize_filename("été"), "_t_");
+    }
+
+    #[test]
+    fn sanitize_filename_empty() {
+        assert_eq!(sanitize_filename(""), "");
+    }
+
+    #[test]
+    fn loopback_host_detection() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("::"));
+        assert!(!is_loopback_host("192.168.1.10"));
+        assert!(!is_loopback_host("example.com"), "unknown hostnames are treated as non-loopback");
+    }
+
+    #[test]
+    fn constant_time_eq_basic() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secres"));
+        assert!(!constant_time_eq(b"secret", b"secret2"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+}
