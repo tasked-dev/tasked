@@ -323,7 +323,7 @@ pub struct Queue {
 ///
 /// Use struct update syntax with `Default` to set only the fields you need:
 /// ```rust
-/// use crate::types::*;
+/// use tasked::types::*;
 ///
 /// let task = TaskDef {
 ///     id: TaskId::from("my-task"),

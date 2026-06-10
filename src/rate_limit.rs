@@ -7,11 +7,11 @@ use std::time::Instant;
 /// Each `try_acquire` consumes one token if available.
 pub struct RateLimiter {
     max_burst: u64,
-    /// Tokens added per nanosecond (stored as fixed-point: tokens * 1e9)
+    /// Nanoseconds that must elapse to earn one token (>= 1).
     nanos_per_token: u64,
-    /// State packed as: available_tokens (top 32 bits) | timestamp_nanos_offset (bottom 32 bits)
-    /// We use separate atomics for clarity and correctness.
-    tokens_nanos: AtomicU64,
+    /// Currently available tokens.
+    tokens: AtomicU64,
+    /// Elapsed-nanos timestamp (relative to `epoch`) of the last refill.
     last_refill_nanos: AtomicU64,
     epoch: Instant,
 }
@@ -45,7 +45,7 @@ impl RateLimiter {
         Self {
             max_burst,
             nanos_per_token,
-            tokens_nanos: AtomicU64::new(max_burst),
+            tokens: AtomicU64::new(max_burst),
             last_refill_nanos: AtomicU64::new(0),
             epoch,
         }
@@ -56,11 +56,11 @@ impl RateLimiter {
         self.refill();
 
         loop {
-            let current = self.tokens_nanos.load(Ordering::Acquire);
+            let current = self.tokens.load(Ordering::Acquire);
             if current == 0 {
                 return false;
             }
-            match self.tokens_nanos.compare_exchange_weak(
+            match self.tokens.compare_exchange_weak(
                 current,
                 current - 1,
                 Ordering::AcqRel,
@@ -96,12 +96,12 @@ impl RateLimiter {
         {
             // We won the race — add the tokens
             loop {
-                let current = self.tokens_nanos.load(Ordering::Acquire);
+                let current = self.tokens.load(Ordering::Acquire);
                 let desired = (current + new_tokens).min(self.max_burst);
                 if desired == current {
                     break;
                 }
-                match self.tokens_nanos.compare_exchange_weak(
+                match self.tokens.compare_exchange_weak(
                     current,
                     desired,
                     Ordering::AcqRel,

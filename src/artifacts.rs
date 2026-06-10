@@ -48,9 +48,9 @@ fn validate_name(name: &str, base: &Path) -> Result<(), ArtifactError> {
     }
 
     // Final check: the joined path must stay within the base directory.
-    // Use lexical normalization (no filesystem access needed) since we already
-    // rejected `..` and absolute paths above. The canonicalize check guards
-    // against any edge cases.
+    // This is a lexical check (no filesystem access): `..` and absolute
+    // paths were already rejected above, so a name can only stay inside
+    // `base` or fail this prefix test.
     let joined = base.join(name);
     if !joined.starts_with(base) {
         return Err(ArtifactError::InvalidName(format!(
@@ -103,13 +103,13 @@ impl ArtifactStore for LocalArtifactStore {
     async fn upload(&self, flow_id: &FlowId, name: &str, data: &[u8]) -> Result<(), ArtifactError> {
         let dir = self.flow_dir(flow_id)?;
         validate_name(name, &dir)?;
-        std::fs::create_dir_all(&dir)?;
         let path = dir.join(name);
-        // Create parent dirs if name has slashes (e.g., "build/output.tar.gz")
+        // Create parent dirs if name has slashes (e.g., "build/output.tar.gz");
+        // this also creates the flow directory itself.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        std::fs::write(&path, data)?;
+        tokio::fs::write(&path, data).await?;
         Ok(())
     }
 
@@ -117,7 +117,7 @@ impl ArtifactStore for LocalArtifactStore {
         let dir = self.flow_dir(flow_id)?;
         validate_name(name, &dir)?;
         let path = dir.join(name);
-        Ok(std::fs::read(&path)?)
+        Ok(tokio::fs::read(&path).await?)
     }
 
     async fn list(&self, flow_id: &FlowId) -> Result<Vec<String>, ArtifactError> {
@@ -125,16 +125,22 @@ impl ArtifactStore for LocalArtifactStore {
         if !dir.exists() {
             return Ok(vec![]);
         }
-        let mut names = Vec::new();
-        collect_files(&dir, &dir, &mut names)?;
-        names.sort();
+        // Recursive directory walk — run it off the async runtime threads.
+        let names = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<String>> {
+            let mut names = Vec::new();
+            collect_files(&dir, &dir, &mut names)?;
+            names.sort();
+            Ok(names)
+        })
+        .await
+        .map_err(|e| ArtifactError::Other(format!("list task panicked: {e}")))??;
         Ok(names)
     }
 
     async fn cleanup(&self, flow_id: &FlowId) -> Result<(), ArtifactError> {
         let dir = self.flow_dir(flow_id)?;
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
+            tokio::fs::remove_dir_all(&dir).await?;
         }
         Ok(())
     }

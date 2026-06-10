@@ -61,7 +61,7 @@
 //!
 //! ```toml
 //! # Cargo.toml — minimal dependency, no SQLite/HTTP/shell
-//! tasked = { version = "0.1", default-features = false }
+//! tasked = { version = "0.0.3", default-features = false }
 //! ```
 //!
 //! ### Rust functions as executors
@@ -120,7 +120,7 @@
 //! (`MemoryStorage` + `CallbackExecutor` only):
 //!
 //! ```toml
-//! tasked = { version = "0.1", default-features = false }
+//! tasked = { version = "0.0.3", default-features = false }
 //! ```
 //!
 //! | Feature      | Default | Description |

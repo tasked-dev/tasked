@@ -86,9 +86,6 @@ impl Default for EngineConfig {
     }
 }
 
-/// The core task execution engine.
-///
-/// Manages queues, accepts flow submissions, resolves task dependencies,
 /// In-memory dependency resolution for a single flow.
 ///
 /// Tracks reverse dependencies (task → who depends on it) and unsatisfied counts
@@ -278,6 +275,9 @@ impl ActiveQueues {
     }
 }
 
+/// The core task execution engine.
+///
+/// Manages queues, accepts flow submissions, resolves task dependencies,
 /// dispatches tasks to registered [`Executor`]s, and handles retries, timeouts,
 /// and cancellation.
 ///

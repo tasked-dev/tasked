@@ -49,14 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         executor: "greet".into(),
                         config: serde_json::json!({ "name": "Tasked" }),
                         depends_on: vec![],
-                        ..default_task_def()
+                        ..Default::default()
                     },
                     TaskDef {
                         id: TaskId::from("done"),
                         executor: "noop".into(),
                         config: serde_json::json!({}),
                         depends_on: vec![TaskId::from("say-hello")],
-                        ..default_task_def()
+                        ..Default::default()
                     },
                 ],
                 ..FlowDef::default()
@@ -85,17 +85,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn default_task_def() -> TaskDef {
-    TaskDef {
-        id: TaskId::from(""),
-        executor: String::new(),
-        config: serde_json::json!({}),
-        input: None,
-        depends_on: vec![],
-        timeout_secs: None,
-        retries: None,
-        backoff: None,
-        condition: None,
-        spawn_output: vec![],
-    }
-}

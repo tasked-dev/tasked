@@ -88,10 +88,11 @@ fn interpolate_string(s: &str, outputs: &TaskOutputs, secrets: &Secrets) -> Valu
         return Value::String(s.to_string());
     }
 
-    // Check if the entire string is exactly one variable reference
-    let trimmed = s.trim();
-    if trimmed.starts_with("${") && trimmed.ends_with('}') && count_refs(trimmed) == 1 {
-        if let Some(resolved) = resolve_ref(&trimmed[2..trimmed.len() - 1], outputs, secrets) {
+    // Check if the entire string is exactly one variable reference.
+    // Exact match only: `" ${ref} "` is mixed content (the surrounding
+    // whitespace is meaningful), not a typed whole-string reference.
+    if let Some(ref_path) = whole_string_ref(s) {
+        if let Some(resolved) = resolve_ref(ref_path, outputs, secrets) {
             return resolved;
         }
         // If resolution fails, return original string
@@ -103,27 +104,15 @@ fn interpolate_string(s: &str, outputs: &TaskOutputs, secrets: &Secrets) -> Valu
     Value::String(result)
 }
 
-/// Count the number of `${...}` references in a string.
-fn count_refs(s: &str) -> usize {
-    let mut count = 0;
-    let mut depth = 0;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
-            if depth == 0 {
-                count += 1;
-            }
-            depth += 1;
-            i += 2;
-        } else if bytes[i] == b'}' && depth > 0 {
-            depth -= 1;
-            i += 1;
-        } else {
-            i += 1;
-        }
+/// If the string is exactly one `${...}` reference, return the inner path.
+/// Uses the same non-nesting rule as [`replace_refs`] (a reference ends at
+/// the first `}`), so the two parsers can never disagree.
+fn whole_string_ref(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix("${")?.strip_suffix('}')?;
+    if inner.contains("${") || inner.contains('}') {
+        return None;
     }
-    count
+    Some(inner)
 }
 
 /// Replace all `${...}` references with their string representations.

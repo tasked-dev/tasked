@@ -176,56 +176,8 @@ impl TaskGraph {
             .collect()
     }
 
-    /// Returns the task IDs that `task_id` depends on (its predecessors).
-    pub fn dependencies_of(&self, task_id: &TaskId) -> Vec<TaskId> {
-        let Some(&idx) = self.node_map.get(task_id) else {
-            return vec![];
-        };
-        self.graph
-            .neighbors_directed(idx, petgraph::Direction::Incoming)
-            .map(|n| self.graph[n].clone())
-            .collect()
-    }
-
-    /// Returns the task IDs that depend on `task_id` (its successors).
-    pub fn dependents_of(&self, task_id: &TaskId) -> Vec<TaskId> {
-        let Some(&idx) = self.node_map.get(task_id) else {
-            return vec![];
-        };
-        self.graph
-            .neighbors_directed(idx, petgraph::Direction::Outgoing)
-            .map(|n| self.graph[n].clone())
-            .collect()
-    }
-
-    /// Returns all task IDs in topological order.
-    pub fn topological_order(&self) -> Vec<TaskId> {
-        toposort(&self.graph, None)
-            .expect("already validated as acyclic")
-            .into_iter()
-            .map(|idx| self.graph[idx].clone())
-            .collect()
-    }
-
     /// Returns total number of tasks.
     pub fn task_count(&self) -> usize {
         self.graph.node_count()
-    }
-
-    /// Recursively collect all transitive dependents of a task (for cascade cancellation).
-    pub fn all_dependents(&self, task_id: &TaskId) -> Vec<TaskId> {
-        let mut result = Vec::new();
-        let mut stack = vec![task_id.clone()];
-        let mut visited = std::collections::HashSet::new();
-
-        while let Some(current) = stack.pop() {
-            for dep in self.dependents_of(&current) {
-                if visited.insert(dep.clone()) {
-                    result.push(dep.clone());
-                    stack.push(dep);
-                }
-            }
-        }
-        result
     }
 }

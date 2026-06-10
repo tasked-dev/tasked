@@ -20,6 +20,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --all-features covers sqlite/http/shell/scripting/journaled/docker
+      # (docker executor tests must not require a running daemon).
+      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --doc
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
