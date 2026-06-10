@@ -33,7 +33,9 @@ impl Executor for ApprovalExecutor {
             .unwrap_or("Approval required")
             .to_string();
 
-        let code = format!("{:08x}", random::<u32>());
+        // 128 bits: the code may be used as an approval credential, so it
+        // must not be brute-forceable.
+        let code = format!("{:016x}{:016x}", random::<u64>(), random::<u64>());
 
         ExecuteResult::AwaitingApproval {
             output: json!({

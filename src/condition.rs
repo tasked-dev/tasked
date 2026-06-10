@@ -126,8 +126,22 @@ fn build_scope(outputs: &TaskOutputs, secrets: &Secrets) -> Scope<'static> {
 }
 
 /// Synchronous inner evaluation — runs on a blocking thread.
+///
+/// The deadline is measured from the start of the evaluation itself (via
+/// Rhai's progress callback), not from when the future was created: under
+/// load, blocking-pool queueing delay would otherwise count against the
+/// timeout and fail perfectly valid conditions — which the engine treats
+/// as a terminal task failure with cascading cancellation.
 fn evaluate_sync(expr: &str, outputs: &TaskOutputs, secrets: &Secrets) -> Result<bool, String> {
-    let engine = make_engine();
+    let mut engine = make_engine();
+    let start = std::time::Instant::now();
+    engine.on_progress(move |_| {
+        if start.elapsed() > EVAL_TIMEOUT {
+            Some(Dynamic::UNIT) // terminate evaluation
+        } else {
+            None
+        }
+    });
     let mut scope = build_scope(outputs, secrets);
     engine
         .eval_expression_with_scope::<bool>(&mut scope, expr)
@@ -141,9 +155,10 @@ fn evaluate_sync(expr: &str, outputs: &TaskOutputs, secrets: &Secrets) -> Result
 /// as `secrets.<name>`. Values are passed as native Rhai types, never
 /// string-interpolated, preventing injection attacks.
 ///
-/// The evaluation runs on a blocking thread with a wall-clock timeout
-/// (`EVAL_TIMEOUT`) to prevent runaway expressions from stalling the
-/// async executor.
+/// The evaluation runs on a blocking thread. Termination is guaranteed by
+/// the engine's operation limit, and an in-evaluation deadline
+/// (`EVAL_TIMEOUT`, measured from eval start, not from spawn) bounds
+/// wall-clock time without penalizing blocking-pool queueing delay.
 ///
 /// Returns true/false or an error for invalid/timed-out expressions.
 pub async fn evaluate(
@@ -155,15 +170,8 @@ pub async fn evaluate(
     let outputs = outputs.clone();
     let secrets = secrets.clone();
 
-    let result = tokio::time::timeout(
-        EVAL_TIMEOUT,
-        tokio::task::spawn_blocking(move || evaluate_sync(&expr, &outputs, &secrets)),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(inner)) => inner,
-        Ok(Err(join_err)) => Err(format!("condition eval panicked: {join_err}")),
-        Err(_elapsed) => Err("condition evaluation timed out".to_string()),
+    match tokio::task::spawn_blocking(move || evaluate_sync(&expr, &outputs, &secrets)).await {
+        Ok(inner) => inner,
+        Err(join_err) => Err(format!("condition eval panicked: {join_err}")),
     }
 }

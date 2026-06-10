@@ -315,8 +315,14 @@ pub struct Engine {
     completion_buffer: std::sync::Mutex<HashMap<QueueId, Vec<CompletionEvent>>>,
     /// Per-queue wake signals. Workers block on their queue's Notify.
     queue_notifiers: std::sync::Mutex<HashMap<QueueId, Arc<Notify>>>,
-    /// Handles for active queue workers (for cleanup on queue deletion).
-    queue_workers: std::sync::Mutex<HashMap<QueueId, tokio::task::JoinHandle<()>>>,
+    /// Active queue workers, keyed by queue with a unique worker id so an
+    /// exiting worker only removes its *own* map entry (an unconditional
+    /// remove could evict a freshly spawned replacement).
+    queue_workers: std::sync::Mutex<HashMap<QueueId, (u64, tokio::task::JoinHandle<()>)>>,
+    /// Monotonic source of worker ids.
+    worker_seq: std::sync::atomic::AtomicU64,
+    /// Set by [`Engine::shutdown`]; makes `run()` exit and stops dispatch.
+    shutdown: std::sync::atomic::AtomicBool,
     /// Lightweight counters for status reporting (not Prometheus — internal only).
     stats: EngineStats,
 }
@@ -413,6 +419,8 @@ impl EngineBuilder {
             completion_buffer: std::sync::Mutex::new(HashMap::new()),
             queue_notifiers: std::sync::Mutex::new(HashMap::new()),
             queue_workers: std::sync::Mutex::new(HashMap::new()),
+            worker_seq: std::sync::atomic::AtomicU64::new(0),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
             stats: EngineStats::new(),
         }
     }
@@ -426,24 +434,7 @@ impl Engine {
 
     /// Create a new engine with the given storage and config.
     pub fn new(store: Arc<dyn Storage>, config: EngineConfig) -> Self {
-        Self {
-            store,
-            executors: HashMap::new(),
-            config,
-            notify: Arc::new(Notify::new()),
-            semaphores: std::sync::Mutex::new(HashMap::new()),
-            rate_limiters: std::sync::Mutex::new(HashMap::new()),
-            active_queues: std::sync::Mutex::new(ActiveQueues::new()),
-            artifacts: None,
-            trigger_depth_cache: std::sync::Mutex::new(HashMap::new()),
-            queue_config_cache: std::sync::Mutex::new(HashMap::new()),
-            delayed_task_count: std::sync::atomic::AtomicUsize::new(0),
-            dep_graphs: std::sync::Mutex::new(HashMap::new()),
-            completion_buffer: std::sync::Mutex::new(HashMap::new()),
-            queue_notifiers: std::sync::Mutex::new(HashMap::new()),
-            queue_workers: std::sync::Mutex::new(HashMap::new()),
-            stats: EngineStats::new(),
-        }
+        Self::builder(store).config(config).build()
     }
 
     /// Set the artifact storage backend.
@@ -500,19 +491,38 @@ impl Engine {
         let mut workers = self.queue_workers.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if there's already a live worker for this queue
-        if let Some(handle) = workers.get(&queue_id)
+        if let Some((_, handle)) = workers.get(&queue_id)
             && !handle.is_finished()
         {
             return;
         }
 
+        let worker_id = self
+            .worker_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let notify = self.get_or_create_queue_notify(&queue_id);
         let engine = self.clone();
         let qid = queue_id.clone();
         let handle = tokio::spawn(async move {
-            queue_worker_loop(engine, qid, notify).await;
+            queue_worker_loop(engine, qid, worker_id, notify).await;
         });
-        workers.insert(queue_id, handle);
+        workers.insert(queue_id, (worker_id, handle));
+    }
+
+    /// Stop background processing: aborts all queue workers and makes `run()`
+    /// exit (which in turn stops the global sweeper). Safe to call multiple
+    /// times. Storage is left consistent — workers are only cancelled at
+    /// await points, never mid-write.
+    pub fn shutdown(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut workers = self.queue_workers.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, (_, handle)) in workers.drain() {
+            handle.abort();
+        }
+        drop(workers);
+        // Wake run()'s main loop so it observes the flag promptly.
+        self.notify.notify_one();
     }
 
     /// Ensure every active queue has a running worker.
@@ -700,7 +710,7 @@ impl Engine {
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
         // Abort the queue worker (if running) and clean up its notifier.
-        if let Some(handle) = self
+        if let Some((_, handle)) = self
             .queue_workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -941,8 +951,20 @@ impl Engine {
     }
 
     /// Cancel a flow and all its non-terminal tasks.
+    ///
+    /// Cancelling a flow that is already terminal is a no-op: a finished
+    /// flow's state (Succeeded/Failed) is part of the audit record and must
+    /// not be rewritten to Cancelled.
     #[instrument(skip(self), fields(flow_id = %flow_id))]
     pub async fn cancel_flow(&self, flow_id: &FlowId) -> Result<(), EngineError> {
+        let flow = self.store.get_flow(flow_id).await?.ok_or_else(|| {
+            EngineError::Storage(StorageError::FlowNotFound(flow_id.as_str().to_owned()))
+        })?;
+        if flow.state.is_terminal() {
+            debug!(flow_id = %flow_id, state = %flow.state, "cancel ignored — flow already terminal");
+            return Ok(());
+        }
+
         let tasks = self.store.get_flow_tasks(flow_id).await?;
         for task in &tasks {
             if !task.state.is_terminal() && task.state.can_transition_to(TaskState::Cancelled) {
@@ -963,16 +985,13 @@ impl Engine {
         self.cancel_child_flows(flow_id).await;
 
         // Metrics + deactivate queue if no more running flows
-        if let Ok(Some(flow)) = self.store.get_flow(flow_id).await {
-            metrics::counter!(
-                "tasked_flows_completed_total",
-                "queue_id" => flow.queue_id.as_str().to_owned(),
-                "status" => "cancelled"
-            )
-            .increment(1);
-
-            self.deactivate_if_idle(&flow.queue_id).await?;
-        }
+        metrics::counter!(
+            "tasked_flows_completed_total",
+            "queue_id" => flow.queue_id.as_str().to_owned(),
+            "status" => "cancelled"
+        )
+        .increment(1);
+        self.deactivate_if_idle(&flow.queue_id).await?;
 
         debug!(flow_id = %flow_id, "flow cancelled");
         Ok(())
@@ -1171,7 +1190,7 @@ impl Engine {
 
         // Spawn the global sweeper for periodic cross-queue operations
         let sweeper_engine = self.clone();
-        let _sweeper_handle = tokio::spawn(async move {
+        let sweeper_handle = tokio::spawn(async move {
             global_sweeper_loop(sweeper_engine).await;
         });
 
@@ -1184,15 +1203,26 @@ impl Engine {
                 _ = tokio::time::sleep(self.config.poll_interval) => {}
             }
 
+            if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                info!("engine shutdown requested");
+                break;
+            }
+
             // Check storage backend health (detects dead journal writer, etc.)
             if let Err(e) = self.store.health_check().await {
                 error!(error = %e, "storage health check failed — stopping dispatch");
+                // Actually stop dispatch: without this, the already-spawned
+                // workers and sweeper would keep running after the break.
+                self.shutdown();
                 break;
             }
 
             // Ensure every active queue has a running worker
             self.ensure_workers_for_active_queues();
         }
+
+        sweeper_handle.abort();
+        info!("engine stopped");
     }
 
     /// Run a single processing cycle. Useful for testing.
@@ -1910,11 +1940,30 @@ impl Engine {
                 }
             };
 
-            let executor = self
-                .executors
-                .get(&task.executor_type)
-                .ok_or_else(|| EngineError::NoExecutor(task.executor_type.clone()))?
-                .clone();
+            let Some(executor) = self.executors.get(&task.executor_type).cloned() else {
+                // A task with an unregistered executor (e.g. after a restart
+                // with different features) must not wedge the whole queue:
+                // fail it instead of aborting the dispatch loop. The permit
+                // drops here, returning the semaphore slot.
+                warn!(
+                    task_id = %task.id,
+                    flow_id = %task.flow_id,
+                    executor = %task.executor_type,
+                    "no executor registered — failing task"
+                );
+                self.handle_task_result(
+                    &task,
+                    ExecuteResult::Failed {
+                        error: format!(
+                            "no executor registered for type '{}'",
+                            task.executor_type
+                        ),
+                        retryable: false,
+                    },
+                )
+                .await?;
+                continue;
+            };
 
             // Resolve trigger depth from engine-level cache (persists across cycles).
             let t0 = std::time::Instant::now();
@@ -2081,11 +2130,26 @@ impl Engine {
                 }
             }
 
-            let executor = self
-                .executors
-                .get(&task.executor_type)
-                .ok_or_else(|| EngineError::NoExecutor(task.executor_type.clone()))?
-                .clone();
+            let Some(executor) = self.executors.get(&task.executor_type).cloned() else {
+                warn!(
+                    task_id = %task.id,
+                    flow_id = %task.flow_id,
+                    executor = %task.executor_type,
+                    "no executor registered — failing task"
+                );
+                self.handle_task_result(
+                    &task,
+                    ExecuteResult::Failed {
+                        error: format!(
+                            "no executor registered for type '{}'",
+                            task.executor_type
+                        ),
+                        retryable: false,
+                    },
+                )
+                .await?;
+                continue;
+            };
 
             batch_ids.push((task.id.clone(), task.flow_id.clone()));
             eligible.push(SyncEligible { task, executor });
@@ -2201,15 +2265,12 @@ impl Engine {
 
                 if retryable && task.retries_remaining > 0 {
                     // Schedule retry -- compute which attempt this is so backoff
-                    // escalates. retries_remaining starts at max_retries and is
-                    // decremented each retry, so attempt = max_retries - retries_remaining.
-                    let max_retries = self
-                        .store
-                        .get_queue(&task.queue_id)
-                        .await?
-                        .map(|q| q.config.max_retries)
-                        .unwrap_or(task.retries_remaining);
-                    let attempt = max_retries.saturating_sub(task.retries_remaining);
+                    // escalates: attempt = initial_retries - retries_remaining.
+                    // The initial budget must honor per-task `retries` overrides;
+                    // using the queue's max_retries alone made attempt saturate
+                    // at 0 (constant backoff) for tasks with a larger override.
+                    let initial_retries = self.initial_retries_for(task).await;
+                    let attempt = initial_retries.saturating_sub(task.retries_remaining);
                     let delay_ms = task.backoff.delay_ms(attempt);
                     let retry_at = Utc::now() + Duration::milliseconds(delay_ms as i64);
 
@@ -2809,7 +2870,11 @@ impl Engine {
                     .increment(1);
                 }
                 Err(e) => {
-                    error!(schedule_id = %schedule.id, error = %e, "failed to submit scheduled flow");
+                    // Leave next_run_at untouched so the occurrence is retried
+                    // on the next sweep instead of being silently dropped
+                    // (e.g. transient backpressure from max_pending_flows).
+                    error!(schedule_id = %schedule.id, error = %e, "failed to submit scheduled flow — will retry next sweep");
+                    continue;
                 }
             }
             let now = Utc::now();
@@ -2897,10 +2962,47 @@ impl Engine {
         }
     }
 
+    /// Resolve a task's initial retry budget for backoff computation.
+    /// Prefers the task's own `retries` override from the stored FlowDef;
+    /// falls back to the queue's max_retries (covers spawn-injected tasks,
+    /// whose defs are not part of the flow definition).
+    async fn initial_retries_for(&self, task: &Task) -> u32 {
+        if let Ok(Some(flow)) = self.store.get_flow(&task.flow_id).await
+            && let Some(retries) = flow
+                .flow_def
+                .as_ref()
+                .and_then(|fd| fd.tasks.iter().find(|t| t.id == task.id))
+                .and_then(|def| def.retries)
+        {
+            return retries;
+        }
+        match self.get_cached_queue_config(&task.queue_id).await {
+            Some(config) => config.max_retries.max(task.retries_remaining),
+            None => task.retries_remaining,
+        }
+    }
+
     /// Recover tasks that have been running longer than their timeout.
     async fn recover_timed_out_tasks(&self) -> Result<(), EngineError> {
         let timed_out = self.store.fetch_timed_out_tasks().await?;
         for task in &timed_out {
+            // Approval tasks intentionally stay Running (with their original
+            // started_at) until acked via the API — they wait for a human,
+            // not for an executor, so the task timeout does not apply.
+            if task
+                .output
+                .as_ref()
+                .and_then(|o| o.get("awaiting_approval"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                debug!(
+                    task_id = %task.id,
+                    flow_id = %task.flow_id,
+                    "skipping timeout recovery for task awaiting approval"
+                );
+                continue;
+            }
             warn!(
                 task_id = %task.id,
                 flow_id = %task.flow_id,
@@ -2948,8 +3050,13 @@ impl FlowSubmitter for EngineFlowSubmitter {
 /// Per-queue worker loop. Each active queue gets one of these running as a
 /// tokio task. The worker blocks on a per-queue `Notify`, waking only when
 /// there is work for this specific queue — idle queues consume zero CPU.
-async fn queue_worker_loop(engine: Arc<Engine>, queue_id: QueueId, notify: Arc<Notify>) {
-    debug!(queue_id = %queue_id, "queue worker started");
+async fn queue_worker_loop(
+    engine: Arc<Engine>,
+    queue_id: QueueId,
+    worker_id: u64,
+    notify: Arc<Notify>,
+) {
+    debug!(queue_id = %queue_id, worker_id, "queue worker started");
 
     // Pre-notify so the first iteration runs immediately without blocking.
     notify.notify_one();
@@ -2990,18 +3097,28 @@ async fn queue_worker_loop(engine: Arc<Engine>, queue_id: QueueId, notify: Arc<N
         }
     }
 
-    // Clean up worker handle and notifier
-    engine
-        .queue_workers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&queue_id);
-    engine
-        .queue_notifiers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&queue_id);
-    debug!(queue_id = %queue_id, "queue worker stopped");
+    // Clean up the worker map entry — but only if it is still *ours*. A
+    // submit_flow may have raced our exit decision and spawned a replacement
+    // worker; removing its entry (and notifier) would strand it on a Notify
+    // nobody signals.
+    {
+        let mut workers = engine
+            .queue_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let is_ours = workers
+            .get(&queue_id)
+            .is_some_and(|(id, _)| *id == worker_id);
+        if is_ours {
+            workers.remove(&queue_id);
+            engine
+                .queue_notifiers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&queue_id);
+        }
+    }
+    debug!(queue_id = %queue_id, worker_id, "queue worker stopped");
 }
 
 /// Global sweeper loop. Handles periodic cross-queue operations that used to
