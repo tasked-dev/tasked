@@ -386,7 +386,10 @@ async fn execute_single(request: reqwest::RequestBuilder) -> ExecuteResult {
                 }
             } else {
                 ExecuteResult::Failed {
-                    error: format!("HTTP {status}: {body}"),
+                    error: format!(
+                        "HTTP {status}: {}",
+                        crate::executor::truncate_body_for_error(&body)
+                    ),
                     retryable: status >= 500,
                 }
             }

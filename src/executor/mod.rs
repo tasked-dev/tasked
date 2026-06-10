@@ -33,19 +33,60 @@ pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Returns the body as a `String`, or an error message if the body exceeds the
 /// limit or cannot be read.
 #[cfg(feature = "http")]
-pub async fn read_response_body(resp: reqwest::Response) -> Result<String, String> {
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("failed to read response body: {e}"))?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
+pub async fn read_response_body(mut resp: reqwest::Response) -> Result<String, String> {
+    // Fast path: if the server declares a Content-Length beyond the cap,
+    // fail before reading anything.
+    if let Some(len) = resp.content_length()
+        && len > MAX_RESPONSE_BYTES as u64
+    {
         return Err(format!(
-            "response body too large: {} bytes (limit: {} bytes)",
-            bytes.len(),
-            MAX_RESPONSE_BYTES
+            "response body too large: {len} bytes (limit: {MAX_RESPONSE_BYTES} bytes)"
         ));
     }
-    String::from_utf8(bytes.to_vec()).map_err(|e| format!("response body is not valid UTF-8: {e}"))
+
+    // Stream the body chunk by chunk, aborting as soon as the running total
+    // exceeds the cap, instead of buffering the whole body first.
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("failed to read response body: {e}"))?;
+        let Some(chunk) = chunk else { break };
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "response body too large: {} bytes (limit: {} bytes)",
+                buf.len() + chunk.len(),
+                MAX_RESPONSE_BYTES
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|e| format!("response body is not valid UTF-8: {e}"))
+}
+
+/// Maximum number of response-body bytes embedded into error strings (4 KB).
+#[cfg(feature = "http")]
+const MAX_ERROR_BODY_BYTES: usize = 4096;
+
+/// Truncate a response body for safe embedding in an error message.
+///
+/// Bodies longer than 4 KB are cut at a char boundary and suffixed with an
+/// ellipsis marker noting how many bytes were dropped.
+#[cfg(feature = "http")]
+pub(crate) fn truncate_body_for_error(body: &str) -> std::borrow::Cow<'_, str> {
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}… [truncated {} bytes]",
+        &body[..end],
+        body.len() - end
+    ))
 }
 
 /// Trait for submitting and querying flows. Implemented by Engine (via wrapper).
@@ -241,5 +282,34 @@ pub struct NoopExecutor;
 impl Executor for NoopExecutor {
     async fn execute(&self, _task: &Task, _ctx: &ExecutionContext) -> ExecuteResult {
         ExecuteResult::Success { output: None }
+    }
+}
+
+#[cfg(all(test, feature = "http"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_body_short_is_unchanged() {
+        let body = "hello";
+        assert_eq!(truncate_body_for_error(body), "hello");
+    }
+
+    #[test]
+    fn truncate_body_long_is_capped_with_marker() {
+        let body = "x".repeat(MAX_ERROR_BODY_BYTES + 100);
+        let out = truncate_body_for_error(&body);
+        assert!(out.starts_with(&"x".repeat(MAX_ERROR_BODY_BYTES)));
+        assert!(out.contains("[truncated 100 bytes]"));
+    }
+
+    #[test]
+    fn truncate_body_respects_char_boundaries() {
+        // Multi-byte char straddling the cap must not cause a panic.
+        let mut body = "x".repeat(MAX_ERROR_BODY_BYTES - 1);
+        body.push_str("é"); // 2 bytes, crosses the boundary
+        body.push_str(&"y".repeat(100));
+        let out = truncate_body_for_error(&body);
+        assert!(out.contains("[truncated"));
     }
 }

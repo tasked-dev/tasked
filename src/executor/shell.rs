@@ -3,13 +3,36 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tracing::{debug, warn};
 
 use super::{ExecutionContext, Executor};
 
 /// Maximum combined stdout+stderr size before truncation (10 MB).
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Marker appended to stderr when output is truncated.
+const TRUNCATION_MARKER: &str = "\n[tasked: output truncated at 10MB]";
+
+/// Send SIGKILL to the entire process group of `pid` (unix only).
+///
+/// The shell is spawned in its own process group so that grandchildren
+/// (e.g. backgrounded processes holding the pipes open) are killed too,
+/// instead of surviving a kill of just the direct `sh` child.
+#[cfg(unix)]
+#[allow(unsafe_code)] // raw libc::kill is the only dependency-free way to signal a process group
+fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // SAFETY: libc::kill has no memory-safety preconditions; a negative
+        // pid targets the process group we created with process_group(0).
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: Option<u32>) {}
 
 /// Shell executor — runs a command via the system shell.
 ///
@@ -44,99 +67,109 @@ impl Executor for ShellExecutor {
             }
         };
 
-        debug!(task_id = %task.id, command = %command, "executing shell command");
+        // Deliberately do NOT log the resolved command: it may contain
+        // interpolated ${secrets.*} values that must not end up in logs.
+        debug!(task_id = %task.id, executor = "shell", "executing shell command");
 
         let timeout = Duration::from_secs(task.timeout_secs);
 
-        let result = tokio::time::timeout(timeout, async {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c").arg(&command);
-            cmd.kill_on_drop(true);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(&command);
+        cmd.kill_on_drop(true);
 
-            // Clear inherited environment to prevent leaking server secrets
-            // (AWS keys, tokens, etc.) into child processes.
-            cmd.env_clear();
+        // Run the shell in its own process group (unix) so we can kill the
+        // whole process tree on timeout or output truncation, not just `sh`.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
-            // Restore PATH so the shell can find binaries
-            if let Some(path) = std::env::var_os("PATH") {
-                cmd.env("PATH", path);
-            }
+        // Clear inherited environment to prevent leaking server secrets
+        // (AWS keys, tokens, etc.) into child processes.
+        cmd.env_clear();
 
-            // Inject user-supplied environment variables from executor config
-            if let Some(env_obj) = task.executor_config.get("env").and_then(|v| v.as_object()) {
-                for (key, value) in env_obj {
-                    if let Some(val) = value.as_str() {
-                        cmd.env(key, val);
-                    }
+        // Restore PATH so the shell can find binaries
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+
+        // Inject user-supplied environment variables from executor config
+        if let Some(env_obj) = task.executor_config.get("env").and_then(|v| v.as_object()) {
+            for (key, value) in env_obj {
+                if let Some(val) = value.as_str() {
+                    cmd.env(key, val);
                 }
             }
+        }
 
-            // Inject TASKED_* artifact environment variables
-            if let Some(ref dir) = ctx.artifacts_dir {
-                cmd.env("TASKED_ARTIFACTS", dir.display().to_string());
+        // Inject TASKED_* artifact environment variables
+        if let Some(ref dir) = ctx.artifacts_dir {
+            cmd.env("TASKED_ARTIFACTS", dir.display().to_string());
+        }
+        if let Some(ref url) = ctx.artifact_url {
+            cmd.env("TASKED_ARTIFACT_URL", url);
+        }
+
+        let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(task_id = %task.id, error = %e, "shell command failed to execute");
+                return ExecuteResult::Failed {
+                    error: format!("failed to execute command: {e}"),
+                    retryable: true,
+                };
             }
-            if let Some(ref url) = ctx.artifact_url {
-                cmd.env("TASKED_ARTIFACT_URL", url);
-            }
+        };
 
-            let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-                Ok(c) => c,
-                Err(e) => return Err(e),
-            };
+        // Captured before the capture future borrows `child`, so the timeout
+        // path can still kill the process group after the future is dropped.
+        let child_pid = child.id();
 
-            let stdout_pipe = child.stdout.take().expect("stdout pipe configured");
-            let stderr_pipe = child.stderr.take().expect("stderr pipe configured");
+        let result = tokio::time::timeout(timeout, async {
+            let mut stdout_pipe = child.stdout.take().expect("stdout pipe configured");
+            let mut stderr_pipe = child.stderr.take().expect("stderr pipe configured");
 
-            let mut stdout_reader = BufReader::new(stdout_pipe).lines();
-            let mut stderr_reader = BufReader::new(stderr_pipe).lines();
+            // Read raw byte chunks rather than lines: a single giant line
+            // without newlines must not buffer unboundedly before the cap
+            // check.
+            let mut stdout_buf: Vec<u8> = Vec::new();
+            let mut stderr_buf: Vec<u8> = Vec::new();
+            let mut out_chunk = [0u8; 8192];
+            let mut err_chunk = [0u8; 8192];
+            let mut stdout_done = false;
+            let mut stderr_done = false;
+            let mut truncated = false;
 
-            let mut stdout = String::new();
-            let mut stderr = String::new();
             let mut last_flush = Instant::now();
             let flush_interval = Duration::from_millis(500);
 
-            let mut stdout_done = false;
-            let mut stderr_done = false;
-
             while !stdout_done || !stderr_done {
                 tokio::select! {
-                    line = stdout_reader.next_line(), if !stdout_done => {
-                        match line {
-                            Ok(Some(line)) => {
-                                stdout.push_str(&line);
-                                stdout.push('\n');
-                                if stdout.len() + stderr.len() > MAX_OUTPUT_BYTES {
-                                    warn!(task_id = %task.id, "output exceeded 10 MB, truncating");
-                                    stderr.push_str("\n[tasked: output truncated at 10MB]");
-                                    stdout_done = true;
-                                    stderr_done = true;
-                                }
-                            }
-                            _ => stdout_done = true,
-                        }
-                    }
-                    line = stderr_reader.next_line(), if !stderr_done => {
-                        match line {
-                            Ok(Some(line)) => {
-                                stderr.push_str(&line);
-                                stderr.push('\n');
-                                if stdout.len() + stderr.len() > MAX_OUTPUT_BYTES {
-                                    warn!(task_id = %task.id, "output exceeded 10 MB, truncating");
-                                    stderr.push_str("\n[tasked: output truncated at 10MB]");
-                                    stdout_done = true;
-                                    stderr_done = true;
-                                }
-                            }
-                            _ => stderr_done = true,
-                        }
-                    }
+                    n = stdout_pipe.read(&mut out_chunk), if !stdout_done => match n {
+                        Ok(0) | Err(_) => stdout_done = true,
+                        Ok(n) => stdout_buf.extend_from_slice(&out_chunk[..n]),
+                    },
+                    n = stderr_pipe.read(&mut err_chunk), if !stderr_done => match n {
+                        Ok(0) | Err(_) => stderr_done = true,
+                        Ok(n) => stderr_buf.extend_from_slice(&err_chunk[..n]),
+                    },
+                }
+
+                if stdout_buf.len() + stderr_buf.len() > MAX_OUTPUT_BYTES {
+                    // Kill the child (and its whole process group) instead of
+                    // merely closing the pipes: a child blocked writing to a
+                    // full pipe would otherwise hang until the outer timeout,
+                    // discarding all captured output.
+                    warn!(task_id = %task.id, "output exceeded 10 MB, truncating and killing child");
+                    truncated = true;
+                    kill_process_group(child_pid);
+                    let _ = child.kill().await;
+                    break;
                 }
 
                 // Periodic flush to storage
                 if last_flush.elapsed() >= flush_interval {
                     ctx.flush_output(json!({
-                        "stdout": &stdout,
-                        "stderr": &stderr,
+                        "stdout": String::from_utf8_lossy(&stdout_buf),
+                        "stderr": String::from_utf8_lossy(&stderr_buf),
                         "exit_code": null,
                     }))
                     .await;
@@ -145,7 +178,12 @@ impl Executor for ShellExecutor {
             }
 
             let status = child.wait().await?;
-            Ok((stdout, stderr, status))
+            let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+            let mut stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+            if truncated {
+                stderr.push_str(TRUNCATION_MARKER);
+            }
+            Ok::<_, std::io::Error>((stdout, stderr, status))
         })
         .await;
 
@@ -177,12 +215,105 @@ impl Executor for ShellExecutor {
                 }
             }
             Err(_) => {
+                // The capture future was dropped by the timeout; make sure the
+                // entire process group is gone, not just the direct child.
+                kill_process_group(child_pid);
+                let _ = child.kill().await;
                 warn!(task_id = %task.id, timeout_secs = task.timeout_secs, "shell command timed out");
                 ExecuteResult::Failed {
                     error: format!("command timed out after {}s", task.timeout_secs),
                     retryable: true,
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::memory::MemoryStorage;
+    use crate::types::{BackoffStrategy, FlowId, TaskId, TaskState};
+    use std::sync::Arc;
+
+    fn make_task(config: serde_json::Value, timeout_secs: u64) -> Task {
+        Task {
+            id: TaskId::from("test-shell"),
+            flow_id: FlowId::new(),
+            queue_id: crate::types::QueueId::from("test"),
+            state: TaskState::Running,
+            executor_type: "shell".to_string(),
+            executor_config: config,
+            input: None,
+            output: None,
+            error: None,
+            retries_remaining: 0,
+            backoff: BackoffStrategy::default(),
+            timeout_secs,
+            condition: None,
+            retry_at: None,
+            started_at: None,
+            completed_at: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_ctx() -> ExecutionContext {
+        ExecutionContext::new(
+            Arc::new(MemoryStorage::new()),
+            TaskId::from("test-shell"),
+            FlowId::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn runs_simple_command() {
+        let task = make_task(json!({"command": "echo hello"}), 10);
+        let result = ShellExecutor.execute(&task, &make_ctx()).await;
+        match result {
+            ExecuteResult::Success { output: Some(out) } => {
+                assert_eq!(out["exit_code"], 0);
+                assert_eq!(out["stdout"], "hello\n");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn giant_single_line_is_truncated_and_child_killed() {
+        // Emit far more than the cap on a single line with no newline;
+        // the executor must kill the child and return promptly with the
+        // truncation marker rather than hanging until the timeout.
+        let task = make_task(
+            json!({"command": "yes | tr -d '\\n' | head -c 50000000; sleep 60"}),
+            30,
+        );
+        let start = std::time::Instant::now();
+        let result = ShellExecutor.execute(&task, &make_ctx()).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(25),
+            "should not wait for the sleep/timeout"
+        );
+        match result {
+            ExecuteResult::Failed { error, .. } => {
+                assert!(
+                    error.contains("output truncated at 10MB"),
+                    "error should carry the truncation marker: {error}"
+                );
+            }
+            other => panic!("expected failed (killed child), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_process_group() {
+        let task = make_task(json!({"command": "sleep 30"}), 1);
+        let result = ShellExecutor.execute(&task, &make_ctx()).await;
+        match result {
+            ExecuteResult::Failed { error, .. } => {
+                assert!(error.contains("timed out"), "got: {error}");
+            }
+            other => panic!("expected timeout failure, got {other:?}"),
         }
     }
 }

@@ -216,7 +216,10 @@ impl Executor for RemoteExecutor {
 
                 if !(200..300).contains(&status) {
                     return ExecuteResult::Failed {
-                        error: format!("remote executor returned HTTP {status}: {body}"),
+                        error: format!(
+                            "remote executor returned HTTP {status}: {}",
+                            super::truncate_body_for_error(&body)
+                        ),
                         retryable: status >= 500,
                     };
                 }
@@ -243,7 +246,8 @@ impl Executor for RemoteExecutor {
                     },
                     Err(e) => ExecuteResult::Failed {
                         error: format!(
-                            "failed to parse remote executor response: {e}. Body: {body}"
+                            "failed to parse remote executor response: {e}. Body: {}",
+                            super::truncate_body_for_error(&body)
                         ),
                         retryable: false,
                     },

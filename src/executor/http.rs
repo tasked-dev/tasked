@@ -160,7 +160,7 @@ impl Executor for HttpExecutor {
                     }
                 } else {
                     ExecuteResult::Failed {
-                        error: format!("HTTP {status}: {body}"),
+                        error: format!("HTTP {status}: {}", super::truncate_body_for_error(&body)),
                         retryable: status >= 500,
                     }
                 }
