@@ -28,6 +28,16 @@ const PROVIDER_IMAGES: &[(&str, &str)] = &[
 /// Requires secrets: the provider's API key (e.g., `${secrets.ANTHROPIC_API_KEY}`)
 /// must be available in the task's env via secret interpolation.
 ///
+/// Optional config keys forwarded to the underlying container:
+/// `network` (defaults to `"bridge"` — agent containers need egress to reach
+/// the AI provider API), `working_dir`, `memory_mb`, `cpus`, `pids_limit`.
+///
+/// **Note:** the wrapped [`ContainerExecutor`]'s network policy must allow the
+/// requested network. Since agent tasks default to `"bridge"`, configure the
+/// container executor with e.g.
+/// `ContainerExecutor::new(backend).with_allowed_networks(vec!["none".into(), "bridge".into()])`,
+/// otherwise every agent task will fail its network policy check.
+///
 /// Returns: `{ "provider", "model", "response", "usage": { "input_tokens", "output_tokens" } }`
 pub struct AgentExecutor {
     container: ContainerExecutor,
@@ -127,11 +137,29 @@ impl Executor for AgentExecutor {
 
         // Build a synthetic task that uses the container executor
         let mut container_task = task.clone();
-        container_task.executor_config = json!({
+        let mut container_config = json!({
             "image": image,
             "env": env.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, serde_json::Value>>(),
             "timeout_secs": task.timeout_secs,
+            // Agent containers must reach the AI provider API, so default to
+            // "bridge" instead of the container executor's "none" default.
+            // The ContainerExecutor's network policy must allow this network.
+            "network": task
+                .executor_config
+                .get("network")
+                .and_then(|v| v.as_str())
+                .unwrap_or("bridge"),
         });
+
+        // Pass through optional container settings from the agent task config.
+        if let Some(obj) = container_config.as_object_mut() {
+            for key in ["working_dir", "memory_mb", "cpus", "pids_limit"] {
+                if let Some(value) = task.executor_config.get(key) {
+                    obj.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        container_task.executor_config = container_config;
 
         // Delegate to container executor
         let result = self.container.execute(&container_task, ctx).await;

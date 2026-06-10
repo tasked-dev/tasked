@@ -23,18 +23,43 @@ use super::{ExecutionContext, Executor};
 /// Maximum combined stdout+stderr size before truncation (10 MB).
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
+/// Truncate `s` to at most `max` bytes, backing up to a char boundary.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Container executor — delegates to a ContainerBackend (Docker, Fly, etc.)
 pub struct ContainerExecutor {
     backend: Box<dyn ContainerBackend>,
     /// If non-empty, only images whose name starts with one of these prefixes
     /// may be pulled. If empty, all images are allowed (backwards compatible).
+    /// Prefix matches must end at a `/`, `:`, `@` or end-of-string boundary,
+    /// so allowing `myorg` does not permit `myorgevil/x`.
     ///
     /// **Warning:** Without an image allowlist, tasks can pull and run arbitrary
     /// images from public registries, which may contain malicious code.
     allowed_image_prefixes: Vec<String>,
     /// If non-empty, only volume host paths under these prefixes are permitted.
-    /// If empty, all volume mounts are rejected.
+    /// If empty, all volume mounts are rejected. Host paths are canonicalized
+    /// (symlinks resolved) before matching.
     allowed_volume_prefixes: Vec<String>,
+    /// Networks tasks may request via the `network` config key.
+    /// Defaults to `["none"]` — tasks cannot opt into network access unless
+    /// the operator explicitly allows it (e.g. `["none", "bridge"]`).
+    allowed_networks: Vec<String>,
+    /// Maximum memory a task may request via `memory_mb` (default 4096 MB).
+    max_memory_mb: u64,
+    /// Maximum CPUs a task may request via `cpus` (default 4.0).
+    max_cpus: f64,
+    /// Maximum PIDs a task may request via `pids_limit` (default 1024).
+    max_pids: i64,
 }
 
 impl ContainerExecutor {
@@ -43,11 +68,16 @@ impl ContainerExecutor {
             backend: Box::new(backend),
             allowed_image_prefixes: Vec::new(),
             allowed_volume_prefixes: Vec::new(),
+            allowed_networks: vec!["none".to_string()],
+            max_memory_mb: DEFAULT_MAX_MEMORY_MB,
+            max_cpus: DEFAULT_MAX_CPUS,
+            max_pids: DEFAULT_MAX_PIDS,
         }
     }
 
     /// Set the allowed image prefixes. When non-empty, only images whose name
-    /// starts with one of these prefixes will be accepted.
+    /// starts with one of these prefixes will be accepted. A prefix match must
+    /// end at a `/`, `:`, `@` or end-of-string boundary.
     ///
     /// **Warning:** Leaving this empty allows *any* image to be pulled and run.
     /// In multi-tenant or untrusted environments, always configure an allowlist.
@@ -58,9 +88,37 @@ impl ContainerExecutor {
 
     /// Set the allowed volume mount prefixes. Only host paths under these
     /// prefixes will be permitted as bind mounts. If empty, all mounts are
-    /// rejected.
+    /// rejected. Host paths are canonicalized before matching, so symlinks
+    /// cannot be used to escape the allowlist.
     pub fn with_allowed_volume_prefixes(mut self, prefixes: Vec<String>) -> Self {
         self.allowed_volume_prefixes = prefixes;
+        self
+    }
+
+    /// Set the Docker network modes tasks may request via the `network`
+    /// config key. Defaults to `["none"]`. Add `"bridge"` to allow egress,
+    /// e.g. for `AgentExecutor` tasks that must reach AI provider APIs.
+    /// Requests for networks outside this list fail non-retryably.
+    pub fn with_allowed_networks(mut self, networks: Vec<String>) -> Self {
+        self.allowed_networks = networks;
+        self
+    }
+
+    /// Set the maximum memory (in MB) a task may request via `memory_mb`.
+    pub fn with_max_memory_mb(mut self, max_memory_mb: u64) -> Self {
+        self.max_memory_mb = max_memory_mb;
+        self
+    }
+
+    /// Set the maximum CPU count a task may request via `cpus`.
+    pub fn with_max_cpus(mut self, max_cpus: f64) -> Self {
+        self.max_cpus = max_cpus;
+        self
+    }
+
+    /// Set the maximum PID limit a task may request via `pids_limit`.
+    pub fn with_max_pids(mut self, max_pids: i64) -> Self {
+        self.max_pids = max_pids;
         self
     }
 }
@@ -69,6 +127,11 @@ impl ContainerExecutor {
 const DEFAULT_MEMORY_BYTES: i64 = 536_870_912; // 512 MB
 const DEFAULT_NANO_CPUS: i64 = 1_000_000_000; // 1 CPU
 const DEFAULT_PIDS_LIMIT: i64 = 256;
+
+/// Default caps on what tasks may request via executor_config overrides.
+const DEFAULT_MAX_MEMORY_MB: u64 = 4096;
+const DEFAULT_MAX_CPUS: f64 = 4.0;
+const DEFAULT_MAX_PIDS: i64 = 1024;
 
 /// Specification for running a container.
 #[derive(Debug, Clone)]
@@ -110,7 +173,9 @@ pub trait ContainerBackend: Send + Sync {
 ///
 /// Uses an allowlist approach: only mounts under the specified prefixes are permitted.
 /// If no prefixes are configured, all volumes are rejected.
-/// Host paths must be absolute and free of path traversal.
+/// Host paths must be absolute, free of path traversal, and are canonicalized
+/// (symlinks resolved) before prefix matching so a symlink under an allowed
+/// prefix cannot escape to an arbitrary host path.
 fn validate_volume(volume: &str, allowed_prefixes: &[String]) -> Result<(), String> {
     let host_path = volume.split(':').next().unwrap_or(volume);
 
@@ -127,17 +192,13 @@ fn validate_volume(volume: &str, allowed_prefixes: &[String]) -> Result<(), Stri
         return Err("mounting root filesystem is not allowed".to_string());
     }
 
-    // Reject path traversal
+    // Lexical first pass: reject path traversal outright.
     if std::path::Path::new(host_path)
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err(format!("path traversal in volume: '{host_path}'"));
     }
-
-    // Canonicalize by resolving . components (we already rejected ..)
-    // and stripping trailing slashes for consistent prefix matching.
-    let normalized = host_path.trim_end_matches('/');
 
     // Check against allowlist — if empty, reject everything.
     if allowed_prefixes.is_empty() {
@@ -146,9 +207,22 @@ fn validate_volume(volume: &str, allowed_prefixes: &[String]) -> Result<(), Stri
         ));
     }
 
+    // Canonicalize the host path (resolving symlinks) so a symlink under an
+    // allowed prefix cannot point outside it. A path that cannot be
+    // canonicalized (e.g. does not exist) is rejected.
+    let canonical = std::fs::canonicalize(host_path).map_err(|e| {
+        format!("volume host path '{host_path}' cannot be canonicalized (must exist): {e}")
+    })?;
+
+    if canonical == std::path::Path::new("/") {
+        return Err("mounting root filesystem is not allowed".to_string());
+    }
+
+    // Canonicalize allowlist entries too; entries that don't exist can never
+    // match and are skipped.
     let allowed = allowed_prefixes.iter().any(|prefix| {
-        let prefix = prefix.trim_end_matches('/');
-        normalized == prefix || normalized.starts_with(&format!("{prefix}/"))
+        std::fs::canonicalize(prefix)
+            .is_ok_and(|canonical_prefix| canonical.starts_with(&canonical_prefix))
     });
 
     if !allowed {
@@ -158,6 +232,20 @@ fn validate_volume(volume: &str, allowed_prefixes: &[String]) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+/// Check whether `image` matches an allowlist `prefix` with a proper boundary:
+/// the match must end at `/`, `:`, `@`, or end-of-string, so allowing `myorg`
+/// does not also permit `myorgevil/x`.
+fn image_matches_prefix(image: &str, prefix: &str) -> bool {
+    match image.strip_prefix(prefix) {
+        None => false,
+        Some(rest) => {
+            rest.is_empty()
+                || rest.starts_with(['/', ':', '@'])
+                || prefix.ends_with(['/', ':', '@'])
+        }
+    }
 }
 
 #[async_trait]
@@ -178,7 +266,7 @@ impl Executor for ContainerExecutor {
             && !self
                 .allowed_image_prefixes
                 .iter()
-                .any(|prefix| image.starts_with(prefix.as_str()))
+                .any(|prefix| image_matches_prefix(&image, prefix))
         {
             return ExecuteResult::Failed {
                 error: format!("image '{image}' is not in the allowed image prefixes"),
@@ -245,36 +333,77 @@ impl Executor for ContainerExecutor {
             }
         }
 
-        // Network mode: default to "none" for isolation, allow override via config (#136).
-        let network_mode = task
-            .executor_config
-            .get("network")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| "none".to_string());
+        // Network mode: default to "none" for isolation. A task may only
+        // request a network that the executor-level policy allows; otherwise
+        // `"network": "host"` would defeat isolation and the SSRF policy.
+        let network_mode = match task.executor_config.get("network").and_then(|v| v.as_str()) {
+            None => "none".to_string(),
+            Some(requested) => {
+                if !self.allowed_networks.iter().any(|n| n == requested) {
+                    return ExecuteResult::Failed {
+                        error: format!(
+                            "network '{requested}' is not allowed by the container executor \
+                             policy (allowed: {})",
+                            self.allowed_networks.join(", ")
+                        ),
+                        retryable: false,
+                    };
+                }
+                requested.to_string()
+            }
+        };
 
-        // Resource limits — override defaults from executor_config.
-        let memory = task
-            .executor_config
-            .get("memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|mb| (mb as i64) * 1_024 * 1_024)
-            .unwrap_or(DEFAULT_MEMORY_BYTES);
+        // Resource limits — task overrides are bounded by executor-level caps.
+        let memory = match task.executor_config.get("memory_mb").and_then(|v| v.as_u64()) {
+            None => DEFAULT_MEMORY_BYTES,
+            Some(mb) => {
+                if mb == 0 || mb > self.max_memory_mb {
+                    return ExecuteResult::Failed {
+                        error: format!(
+                            "memory_mb {mb} is outside the allowed range 1..={} MB",
+                            self.max_memory_mb
+                        ),
+                        retryable: false,
+                    };
+                }
+                (mb as i64) * 1_024 * 1_024
+            }
+        };
 
         let memory_swap = memory; // always equal to memory (disable swap)
 
-        let nano_cpus = task
-            .executor_config
-            .get("cpus")
-            .and_then(|v| v.as_f64())
-            .map(|c| (c * 1_000_000_000.0) as i64)
-            .unwrap_or(DEFAULT_NANO_CPUS);
+        let nano_cpus = match task.executor_config.get("cpus").and_then(|v| v.as_f64()) {
+            None => DEFAULT_NANO_CPUS,
+            Some(cpus) => {
+                if !(cpus > 0.0 && cpus <= self.max_cpus) {
+                    return ExecuteResult::Failed {
+                        error: format!(
+                            "cpus {cpus} is outside the allowed range (0, {}]",
+                            self.max_cpus
+                        ),
+                        retryable: false,
+                    };
+                }
+                (cpus * 1_000_000_000.0) as i64
+            }
+        };
 
-        let pids_limit = task
-            .executor_config
-            .get("pids_limit")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(DEFAULT_PIDS_LIMIT);
+        let pids_limit = match task.executor_config.get("pids_limit").and_then(|v| v.as_i64()) {
+            None => DEFAULT_PIDS_LIMIT,
+            Some(pids) => {
+                // Negative/zero would mean "unlimited" to Docker — reject.
+                if pids < 1 || pids > self.max_pids {
+                    return ExecuteResult::Failed {
+                        error: format!(
+                            "pids_limit {pids} is outside the allowed range 1..={}",
+                            self.max_pids
+                        ),
+                        retryable: false,
+                    };
+                }
+                pids
+            }
+        };
 
         let spec = ContainerSpec {
             image,
@@ -337,6 +466,175 @@ impl Executor for ContainerExecutor {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::memory::MemoryStorage;
+    use crate::types::{BackoffStrategy, FlowId, QueueId, TaskId, TaskState};
+    use std::sync::Arc;
+
+    struct OkBackend;
+
+    #[async_trait]
+    impl ContainerBackend for OkBackend {
+        async fn run(&self, _spec: ContainerSpec) -> Result<ContainerResult, String> {
+            Ok(ContainerResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn make_task(config: serde_json::Value) -> Task {
+        Task {
+            id: TaskId::from("test-container"),
+            flow_id: FlowId::new(),
+            queue_id: QueueId::from("test"),
+            state: TaskState::Running,
+            executor_type: "container".to_string(),
+            executor_config: config,
+            input: None,
+            output: None,
+            error: None,
+            retries_remaining: 0,
+            backoff: BackoffStrategy::default(),
+            timeout_secs: 5,
+            condition: None,
+            retry_at: None,
+            started_at: None,
+            completed_at: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_ctx() -> ExecutionContext {
+        ExecutionContext::new(
+            Arc::new(MemoryStorage::new()),
+            TaskId::from("test-container"),
+            FlowId::new(),
+        )
+    }
+
+    fn assert_policy_failure(result: ExecuteResult, needle: &str) {
+        match result {
+            ExecuteResult::Failed { error, retryable } => {
+                assert!(!retryable, "policy failures must be non-retryable");
+                assert!(error.contains(needle), "error '{error}' should mention '{needle}'");
+            }
+            other => panic!("expected non-retryable failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_prefix_requires_boundary() {
+        assert!(image_matches_prefix("myorg/app:1", "myorg"));
+        assert!(image_matches_prefix("myorg:latest", "myorg"));
+        assert!(image_matches_prefix("myorg@sha256:abc", "myorg"));
+        assert!(image_matches_prefix("myorg", "myorg"));
+        assert!(image_matches_prefix("myorg/app", "myorg/"));
+        assert!(!image_matches_prefix("myorgevil/x", "myorg"));
+        assert!(!image_matches_prefix("evilmyorg/x", "myorg"));
+    }
+
+    #[tokio::test]
+    async fn host_network_rejected_by_default() {
+        let exec = ContainerExecutor::new(OkBackend);
+        let task = make_task(serde_json::json!({"image": "alpine", "network": "host"}));
+        assert_policy_failure(exec.execute(&task, &make_ctx()).await, "network 'host'");
+    }
+
+    #[tokio::test]
+    async fn allowed_network_accepted() {
+        let exec = ContainerExecutor::new(OkBackend)
+            .with_allowed_networks(vec!["none".into(), "bridge".into()]);
+        let task = make_task(serde_json::json!({"image": "alpine", "network": "bridge"}));
+        match exec.execute(&task, &make_ctx()).await {
+            ExecuteResult::Success { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_overrides_above_caps_rejected() {
+        let exec = ContainerExecutor::new(OkBackend);
+        let ctx = make_ctx();
+
+        let task = make_task(serde_json::json!({"image": "alpine", "memory_mb": 8192}));
+        assert_policy_failure(exec.execute(&task, &ctx).await, "memory_mb");
+
+        let task = make_task(serde_json::json!({"image": "alpine", "cpus": 64.0}));
+        assert_policy_failure(exec.execute(&task, &ctx).await, "cpus");
+
+        let task = make_task(serde_json::json!({"image": "alpine", "pids_limit": 100000}));
+        assert_policy_failure(exec.execute(&task, &ctx).await, "pids_limit");
+
+        // Negative pids_limit means "unlimited" to Docker — must be rejected.
+        let task = make_task(serde_json::json!({"image": "alpine", "pids_limit": -1}));
+        assert_policy_failure(exec.execute(&task, &ctx).await, "pids_limit");
+    }
+
+    #[tokio::test]
+    async fn resource_overrides_within_caps_accepted() {
+        let exec = ContainerExecutor::new(OkBackend);
+        let task = make_task(serde_json::json!({
+            "image": "alpine", "memory_mb": 1024, "cpus": 2.0, "pids_limit": 512
+        }));
+        match exec.execute(&task, &make_ctx()).await {
+            ExecuteResult::Success { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_requires_existing_path() {
+        let allowed = vec!["/tmp".to_string()];
+        let err = validate_volume("/tmp/definitely-not-existing-xyz123:/data", &allowed)
+            .expect_err("nonexistent path must be rejected");
+        assert!(err.contains("canonicalized"), "got: {err}");
+    }
+
+    #[test]
+    fn volume_lexical_traversal_rejected() {
+        let allowed = vec!["/tmp".to_string()];
+        assert!(validate_volume("/tmp/../etc:/data", &allowed).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volume_symlink_escape_rejected() {
+        let base = std::env::temp_dir().join(format!("tasked-voltest-{}", uuid::Uuid::new_v4()));
+        let inside = base.join("inside");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = inside.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let allowed = vec![inside.display().to_string()];
+
+        // A real path under the prefix is fine.
+        let sub = inside.join("data");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(validate_volume(&format!("{}:/data", sub.display()), &allowed).is_ok());
+
+        // A symlink under the prefix pointing outside must be rejected.
+        let err = validate_volume(&format!("{}:/data", link.display()), &allowed)
+            .expect_err("symlink escape must be rejected");
+        assert!(err.contains("not under any allowed prefix"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn truncate_helper_respects_char_boundaries() {
+        assert_eq!(truncate_at_char_boundary("hello", 10), "hello");
+        assert_eq!(truncate_at_char_boundary("hello", 3), "hel");
+        // 'é' is 2 bytes; cutting at byte 1 must back up to 0.
+        assert_eq!(truncate_at_char_boundary("é", 1), "");
+    }
+}
+
 #[cfg(feature = "docker")]
 pub mod docker {
     use super::*;
@@ -358,6 +656,23 @@ pub mod docker {
             let client = Docker::connect_with_local_defaults()
                 .map_err(|e| format!("failed to connect to Docker: {e}"))?;
             Ok(Self { client })
+        }
+    }
+
+    /// Best-effort force-remove of a container. Used on every exit path
+    /// (success, timeout, inspect failure, start failure) to avoid leaks.
+    async fn cleanup_container(client: &Docker, container_id: &str) {
+        if let Err(e) = client
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            warn!(container_id = %container_id, error = %e, "failed to remove container");
         }
     }
 
@@ -430,11 +745,11 @@ pub mod docker {
 
             let t_create = t_start.elapsed();
 
-            // Start container
-            self.client
-                .start_container(&container.id, None)
-                .await
-                .map_err(|e| format!("failed to start container: {e}"))?;
+            // Start container — clean up the created container on failure.
+            if let Err(e) = self.client.start_container(&container.id, None).await {
+                cleanup_container(&self.client, &container.id).await;
+                return Err(format!("failed to start container: {e}"));
+            }
 
             let t_started = t_start.elapsed();
 
@@ -444,16 +759,7 @@ pub mod docker {
             let exit_code = loop {
                 if tokio::time::Instant::now() > deadline {
                     let _ = self.client.kill_container(&container.id, None).await;
-                    let _ = self
-                        .client
-                        .remove_container(
-                            &container.id,
-                            Some(RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await;
+                    cleanup_container(&self.client, &container.id).await;
                     return Err(format!(
                         "container timed out after {}s",
                         spec.timeout.as_secs()
@@ -468,16 +774,7 @@ pub mod docker {
                         }
                     }
                     Err(e) => {
-                        let _ = self
-                            .client
-                            .remove_container(
-                                &container.id,
-                                Some(RemoveContainerOptions {
-                                    force: true,
-                                    ..Default::default()
-                                }),
-                            )
-                            .await;
+                        cleanup_container(&self.client, &container.id).await;
                         return Err(format!("container inspect failed: {e}"));
                     }
                 }
@@ -497,21 +794,39 @@ pub mod docker {
             let mut stdout = String::new();
             let mut stderr = String::new();
             let mut truncated = false;
-            while let Some(Ok(log)) = logs_stream.next().await {
+            while let Some(item) = logs_stream.next().await {
+                let log = match item {
+                    Ok(log) => log,
+                    Err(e) => {
+                        warn!(
+                            container_id = %container.id,
+                            error = %e,
+                            "container log stream ended with an error; captured logs may be incomplete"
+                        );
+                        break;
+                    }
+                };
                 if truncated {
                     continue; // drain remaining stream without accumulating
                 }
-                match log {
-                    LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    _ => {}
-                }
-                if stdout.len() + stderr.len() > MAX_OUTPUT_BYTES {
+                // Enforce the cap BEFORE pushing: truncate the chunk to fit
+                // rather than letting one oversized chunk blow past the limit.
+                let remaining = MAX_OUTPUT_BYTES.saturating_sub(stdout.len() + stderr.len());
+                let (target, message) = match &log {
+                    LogOutput::StdOut { message } => (&mut stdout, message),
+                    LogOutput::StdErr { message } => (&mut stderr, message),
+                    _ => continue,
+                };
+                let text = String::from_utf8_lossy(message);
+                if text.len() > remaining {
+                    target.push_str(truncate_at_char_boundary(&text, remaining));
                     truncated = true;
+                    warn!(
+                        container_id = %container.id,
+                        "container logs exceeded 10 MB, truncating"
+                    );
+                } else {
+                    target.push_str(&text);
                 }
             }
 
