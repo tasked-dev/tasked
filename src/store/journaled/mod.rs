@@ -224,7 +224,10 @@ impl Storage for JournaledStorage {
     async fn delete_queue(&self, id: &QueueId) -> Result<(), StorageError> {
         {
             let mut state = self.state.write();
-            state.queues.remove(id);
+            // Cascade: delete the queue's flows, tasks, deps, and schedules,
+            // maintaining secondary indexes. Replay of QueueDeleted performs
+            // the same cascade so recovery matches.
+            state.remove_queue_cascade(id);
         }
         self.emit(JournalEvent::QueueDeleted {
             queue_id: id.clone(),
@@ -243,6 +246,12 @@ impl Storage for JournaledStorage {
     ) -> Result<(), StorageError> {
         {
             let mut state = self.state.write();
+            if state.flows.contains_key(&flow.id) {
+                return Err(StorageError::Internal(format!(
+                    "flow '{}' already exists",
+                    flow.id
+                )));
+            }
             state.flows.insert(flow.id.clone(), flow.clone());
 
             for task in tasks {

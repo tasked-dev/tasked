@@ -70,6 +70,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), StorageError> {
             CREATE INDEX IF NOT EXISTS idx_tasks_running ON tasks(started_at) WHERE state = 'running';
             CREATE INDEX IF NOT EXISTS idx_flows_state ON flows(queue_id, state);
             CREATE INDEX IF NOT EXISTS idx_flows_parent ON flows(parent_flow_id) WHERE parent_flow_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_tasks_flow_id ON tasks(flow_id);
+            CREATE INDEX IF NOT EXISTS idx_task_deps_flow_id ON task_deps(flow_id);
 
             CREATE TABLE IF NOT EXISTS schedules (
                 id TEXT PRIMARY KEY,

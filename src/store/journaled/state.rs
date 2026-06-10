@@ -131,6 +131,41 @@ impl MemState {
         }
     }
 
+    /// Remove a queue and cascade-delete its flows, tasks, deps, dependents
+    /// and schedules, keeping all secondary indexes consistent.
+    ///
+    /// Used by both the live `delete_queue` path and journal replay so that
+    /// recovered state matches live state.
+    pub(crate) fn remove_queue_cascade(&mut self, queue_id: &QueueId) {
+        self.queues.remove(queue_id);
+
+        let flow_ids: HashSet<FlowId> = self
+            .flows
+            .values()
+            .filter(|f| f.queue_id == *queue_id)
+            .map(|f| f.id.clone())
+            .collect();
+        self.flows.retain(|_, f| f.queue_id != *queue_id);
+
+        let task_keys: Vec<(TaskId, FlowId)> = self
+            .tasks
+            .iter()
+            .filter(|(_, t)| t.queue_id == *queue_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &task_keys {
+            if let Some(task) = self.tasks.remove(key) {
+                self.index_remove_all(&task);
+            }
+        }
+        // The whole per-queue ready index entry is gone with the queue.
+        self.ready_index.remove(queue_id);
+
+        self.deps.retain(|(_, fid), _| !flow_ids.contains(fid));
+        self.dependents.retain(|(_, fid), _| !flow_ids.contains(fid));
+        self.schedules.retain(|_, s| s.queue_id != *queue_id);
+    }
+
     /// Transition a task to a new state, maintaining secondary indexes.
     /// Returns an error if the transition is invalid.
     pub(crate) fn transition_task_state(

@@ -226,7 +226,23 @@ impl Storage for SqliteStorage {
     async fn delete_queue(&self, id: &QueueId) -> Result<(), StorageError> {
         let id = id.as_str().to_owned();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM queues WHERE id = ?1", params![id])?;
+            let tx = conn.unchecked_transaction()?;
+            // task_deps has no FK, so clean it up explicitly; flows, tasks and
+            // schedules cascade via FK when the queue row is deleted. Catalog-mode
+            // databases have no task_deps/flows tables, so check first.
+            let has_task_deps: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_deps')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_task_deps {
+                tx.execute(
+                    "DELETE FROM task_deps WHERE flow_id IN (SELECT id FROM flows WHERE queue_id = ?1)",
+                    params![id],
+                )?;
+            }
+            tx.execute("DELETE FROM queues WHERE id = ?1", params![id])?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -980,44 +996,34 @@ impl Storage for SqliteStorage {
             let now = Utc::now();
             let now_str = now.to_rfc3339();
 
-            // Phase 1: Bulk-insert completion data into a temp table
-            tx.execute_batch(
-                "CREATE TEMP TABLE IF NOT EXISTS _batch_complete(\
-                     idx INTEGER, task_id TEXT, flow_id TEXT, output TEXT\
-                 )",
-            )?;
-            tx.execute("DELETE FROM _batch_complete", [])?;
-
+            // Phase 1: Mark each task succeeded with a conditional per-row UPDATE
+            // and record which entries actually transitioned. Entries whose task
+            // is no longer in 'running'/'ready' (e.g. already cancelled) are
+            // skipped and must NOT count towards flow.tasks_succeeded.
+            let mut completed = vec![false; completions.len()];
+            let mut flow_counts: HashMap<String, usize> = HashMap::new();
             {
-                let mut insert_stmt = tx.prepare_cached(
-                    "INSERT INTO _batch_complete(idx, task_id, flow_id, output) VALUES(?1, ?2, ?3, ?4)",
+                let mut complete_stmt = tx.prepare_cached(
+                    "UPDATE tasks SET state = 'succeeded', output = ?1, completed_at = ?2 \
+                     WHERE id = ?3 AND flow_id = ?4 AND state IN ('running', 'ready')",
                 )?;
                 for (i, (task_id, flow_id, output, _)) in completions.iter().enumerate() {
                     let output_json = output.as_ref().map(serde_json::to_string).transpose()?;
-                    insert_stmt.execute(params![
-                        i as i64,
+                    let rows = complete_stmt.execute(params![
+                        output_json,
+                        &now_str,
                         task_id.as_str(),
-                        flow_id.as_str(),
-                        output_json
+                        flow_id.as_str()
                     ])?;
+                    if rows > 0 {
+                        completed[i] = true;
+                        *flow_counts.entry(flow_id.as_str().to_owned()).or_default() += 1;
+                    }
                 }
             }
 
-            // Phase 2: Bulk mark tasks succeeded (single UPDATE from temp table)
-            tx.execute(
-                "UPDATE tasks SET state = 'succeeded', \
-                     output = (SELECT output FROM _batch_complete bc WHERE bc.task_id = tasks.id AND bc.flow_id = tasks.flow_id), \
-                     completed_at = ?1 \
-                 WHERE (id, flow_id) IN (SELECT task_id, flow_id FROM _batch_complete) \
-                 AND state IN ('running', 'ready')",
-                params![&now_str],
-            )?;
-
-            // Phase 3: Batch increment flow counters (one UPDATE per unique flow_id)
-            let mut flow_counts: HashMap<String, usize> = HashMap::new();
-            for (_, flow_id, _, _) in &completions {
-                *flow_counts.entry(flow_id.as_str().to_owned()).or_default() += 1;
-            }
+            // Phase 2: Batch increment flow counters — only for tasks that
+            // actually transitioned (one UPDATE per unique flow_id).
             for (fid, count) in &flow_counts {
                 tx.execute(
                     "UPDATE flows SET tasks_succeeded = tasks_succeeded + ?1, updated_at = ?2 WHERE id = ?3",
@@ -1025,11 +1031,14 @@ impl Storage for SqliteStorage {
                 )?;
             }
 
-            // Phase 4: Promote newly-ready tasks
+            // Phase 3: Promote newly-ready tasks for entries that completed.
             // For tasks with pre-resolved deps (in-memory graph), promote individually.
             // For tasks without, use SQL dep resolution per flow.
             let mut resolved_flows: HashSet<String> = HashSet::new();
-            for (_, flow_id, _, newly_ready) in &completions {
+            for (i, (_, flow_id, _, newly_ready)) in completions.iter().enumerate() {
+                if !completed[i] {
+                    continue;
+                }
                 if !newly_ready.is_empty() {
                     let mut stmt = tx.prepare_cached(
                         "UPDATE tasks SET state = 'ready' WHERE id = ?1 AND flow_id = ?2 AND state = 'pending'",
@@ -1054,7 +1063,7 @@ impl Storage for SqliteStorage {
 
             tx.commit()?;
 
-            // Phase 5: Fetch flows that were modified
+            // Phase 4: Fetch flows that were modified
             let mut flow_cache: HashMap<String, Flow> = HashMap::new();
             for fid in flow_counts.keys() {
                 if let Some(flow) = conn
@@ -1071,10 +1080,17 @@ impl Storage for SqliteStorage {
                 }
             }
 
-            // Build results — all entries are considered succeeded (bulk UPDATE doesn't track per-row)
+            // Build results — None for entries that were skipped (per trait contract).
             let results: Vec<Option<Flow>> = completions
                 .iter()
-                .map(|(_, flow_id, _, _)| flow_cache.get(flow_id.as_str()).cloned())
+                .enumerate()
+                .map(|(i, (_, flow_id, _, _))| {
+                    if completed[i] {
+                        flow_cache.get(flow_id.as_str()).cloned()
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
             Ok(results)
@@ -1093,6 +1109,16 @@ impl Storage for SqliteStorage {
         let deps = deps.clone();
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
+
+            // The flow must exist before tasks can be injected into it.
+            let flow_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM flows WHERE id = ?1)",
+                params![flow_id],
+                |row| row.get(0),
+            )?;
+            if !flow_exists {
+                return Err(StorageError::FlowNotFound(flow_id));
+            }
 
             // Insert tasks
             {

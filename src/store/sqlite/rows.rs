@@ -1,8 +1,40 @@
 use super::super::StorageError;
 use crate::types::*;
 use chrono::{DateTime, Utc};
+use rusqlite::types::Type;
 
-pub(crate) fn parse_task_state(s: &str) -> Result<TaskState, StorageError> {
+/// Build a conversion error for a corrupted column value.
+///
+/// Row mappers must surface corruption as an error instead of fabricating
+/// fallback data (e.g. treating an unknown task state as Pending would
+/// silently re-execute terminal tasks).
+fn corrupt(idx: usize, msg: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(idx, Type::Text, msg.into())
+}
+
+fn parse_dt(idx: usize, field: &str, s: &str) -> Result<DateTime<Utc>, rusqlite::Error> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| corrupt(idx, format!("invalid {field} timestamp {s:?}: {e}")))
+}
+
+fn parse_opt_dt(
+    idx: usize,
+    field: &str,
+    s: Option<String>,
+) -> Result<Option<DateTime<Utc>>, rusqlite::Error> {
+    s.map(|s| parse_dt(idx, field, &s)).transpose()
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(
+    idx: usize,
+    field: &str,
+    s: &str,
+) -> Result<T, rusqlite::Error> {
+    serde_json::from_str(s).map_err(|e| corrupt(idx, format!("invalid {field} JSON: {e}")))
+}
+
+fn task_state_from_str(idx: usize, s: &str) -> Result<TaskState, rusqlite::Error> {
     match s {
         "pending" => Ok(TaskState::Pending),
         "ready" => Ok(TaskState::Ready),
@@ -11,8 +43,12 @@ pub(crate) fn parse_task_state(s: &str) -> Result<TaskState, StorageError> {
         "failed" => Ok(TaskState::Failed),
         "delayed" => Ok(TaskState::Delayed),
         "cancelled" => Ok(TaskState::Cancelled),
-        _ => Err(StorageError::Internal(format!("unknown task state: {s}"))),
+        _ => Err(corrupt(idx, format!("unknown task state: {s}"))),
     }
+}
+
+pub(crate) fn parse_task_state(s: &str) -> Result<TaskState, StorageError> {
+    task_state_from_str(0, s).map_err(|_| StorageError::Internal(format!("unknown task state: {s}")))
 }
 
 pub(crate) fn row_to_queue(row: &rusqlite::Row<'_>) -> Result<Queue, rusqlite::Error> {
@@ -21,13 +57,9 @@ pub(crate) fn row_to_queue(row: &rusqlite::Row<'_>) -> Result<Queue, rusqlite::E
     let created_at_str: String = row.get(2)?;
     let updated_at_str: String = row.get(3)?;
 
-    let config: QueueConfig = serde_json::from_str(&config_str).unwrap_or_default();
-    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
-    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
+    let config: QueueConfig = parse_json(1, "queue config", &config_str)?;
+    let created_at = parse_dt(2, "queue created_at", &created_at_str)?;
+    let updated_at = parse_dt(3, "queue updated_at", &updated_at_str)?;
 
     Ok(Queue {
         id: QueueId::from(id),
@@ -57,20 +89,22 @@ pub(crate) fn row_to_flow(row: &rusqlite::Row<'_>) -> Result<Flow, rusqlite::Err
         "succeeded" => FlowState::Succeeded,
         "failed" => FlowState::Failed,
         "cancelled" => FlowState::Cancelled,
-        _ => FlowState::Running,
+        _ => return Err(corrupt(2, format!("unknown flow state: {state_str}"))),
     };
-    let webhooks: Option<FlowWebhooks> = webhooks_str.and_then(|s| serde_json::from_str(&s).ok());
+    // webhooks/flow_def are optional, forward-compatible structures: tolerate
+    // deserialization failures (with a warning) rather than failing the row.
+    let webhooks: Option<FlowWebhooks> = webhooks_str.and_then(|s| {
+        serde_json::from_str(&s)
+            .map_err(|e| tracing::warn!(flow_id = %id, "failed to deserialize webhooks: {e}"))
+            .ok()
+    });
     let flow_def: Option<FlowDef> = flow_def_str.and_then(|s| {
         serde_json::from_str(&s)
             .map_err(|e| tracing::warn!(flow_id = %id, "failed to deserialize flow_def: {e}"))
             .ok()
     });
-    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
-    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
+    let created_at = parse_dt(11, "flow created_at", &created_at_str)?;
+    let updated_at = parse_dt(12, "flow updated_at", &updated_at_str)?;
 
     Ok(Flow {
         id: FlowId::from(id),
@@ -108,37 +142,24 @@ pub(crate) fn row_to_task(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Err
     let completed_at_str: Option<String> = row.get(15)?;
     let created_at_str: String = row.get(16)?;
 
-    let state = match state_str.as_str() {
-        "pending" => TaskState::Pending,
-        "ready" => TaskState::Ready,
-        "running" => TaskState::Running,
-        "succeeded" => TaskState::Succeeded,
-        "failed" => TaskState::Failed,
-        "delayed" => TaskState::Delayed,
-        "cancelled" => TaskState::Cancelled,
-        _ => TaskState::Pending,
-    };
+    let state = task_state_from_str(3, &state_str)?;
 
     let executor_config: serde_json::Value =
-        serde_json::from_str(&executor_config_str).unwrap_or(serde_json::Value::Null);
-    let input: Option<serde_json::Value> = input_str.and_then(|s| serde_json::from_str(&s).ok());
-    let output: Option<serde_json::Value> = output_str.and_then(|s| serde_json::from_str(&s).ok());
-    let backoff: BackoffStrategy = serde_json::from_str(&backoff_str).unwrap_or_default();
+        parse_json(5, "task executor_config", &executor_config_str)?;
+    let input: Option<serde_json::Value> = input_str
+        .as_deref()
+        .map(|s| parse_json(6, "task input", s))
+        .transpose()?;
+    let output: Option<serde_json::Value> = output_str
+        .as_deref()
+        .map(|s| parse_json(7, "task output", s))
+        .transpose()?;
+    let backoff: BackoffStrategy = parse_json(10, "task backoff", &backoff_str)?;
 
-    let parse_opt_dt = |s: Option<String>| -> Option<DateTime<Utc>> {
-        s.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok()
-        })
-    };
-
-    let retry_at = parse_opt_dt(retry_at_str);
-    let started_at = parse_opt_dt(started_at_str);
-    let completed_at = parse_opt_dt(completed_at_str);
-    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
+    let retry_at = parse_opt_dt(13, "task retry_at", retry_at_str)?;
+    let started_at = parse_opt_dt(14, "task started_at", started_at_str)?;
+    let completed_at = parse_opt_dt(15, "task completed_at", completed_at_str)?;
+    let created_at = parse_dt(16, "task created_at", &created_at_str)?;
 
     Ok(Task {
         id: TaskId::from(id),
@@ -173,27 +194,12 @@ pub(crate) fn row_to_schedule(row: &rusqlite::Row<'_>) -> Result<Schedule, rusql
     let created_at_str: String = row.get(8)?;
     let updated_at_str: String = row.get(9)?;
 
-    let flow_def: FlowDef = serde_json::from_str(&flow_def_str).unwrap_or_else(|_| FlowDef {
-        tasks: vec![],
-        ..FlowDef::default()
-    });
+    let flow_def: FlowDef = parse_json(4, "schedule flow_def", &flow_def_str)?;
 
-    let parse_opt_dt = |s: Option<String>| -> Option<DateTime<Utc>> {
-        s.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok()
-        })
-    };
-
-    let last_triggered_at = parse_opt_dt(last_triggered_at_str);
-    let next_run_at = parse_opt_dt(next_run_at_str);
-    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
-    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
+    let last_triggered_at = parse_opt_dt(6, "schedule last_triggered_at", last_triggered_at_str)?;
+    let next_run_at = parse_opt_dt(7, "schedule next_run_at", next_run_at_str)?;
+    let created_at = parse_dt(8, "schedule created_at", &created_at_str)?;
+    let updated_at = parse_dt(9, "schedule updated_at", &updated_at_str)?;
 
     Ok(Schedule {
         id: ScheduleId::from(id),

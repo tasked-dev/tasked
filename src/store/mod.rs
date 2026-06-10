@@ -218,8 +218,13 @@ pub trait Storage: Send + Sync {
         self.mark_task_succeeded(task_id, flow_id, output).await?;
         let flow = self.increment_flow_counter(flow_id, true).await?;
         for tid in newly_ready {
-            self.update_task_state(tid, flow_id, TaskState::Ready)
-                .await?;
+            // Only promote tasks that are still eligible (i.e. Pending).
+            // A task that was cancelled in the meantime must not be
+            // resurrected — matches the SQLite and journaled backends.
+            match self.update_task_state(tid, flow_id, TaskState::Ready).await {
+                Ok(()) | Err(StorageError::InvalidStateTransition(_, _)) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(flow)
     }

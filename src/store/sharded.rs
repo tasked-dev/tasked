@@ -55,11 +55,34 @@ impl ShardedStorage {
         Ok(storage)
     }
 
+    /// Validate that a queue ID is safe to embed in a shard filename.
+    ///
+    /// Queue IDs are used to derive `queues/<queue_id>.db` paths, so anything
+    /// containing path separators, `..`, or characters outside `[A-Za-z0-9._-]`
+    /// is rejected to prevent path traversal outside the data directory.
+    fn validate_queue_id_for_path(queue_id: &QueueId) -> Result<(), StorageError> {
+        let s = queue_id.as_str();
+        let valid = !s.is_empty()
+            && !s.contains("..")
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !valid {
+            return Err(StorageError::Internal(format!(
+                "invalid queue id {s:?} for sharded storage: queue ids must match \
+                 [A-Za-z0-9._-]+ and must not contain '..'"
+            )));
+        }
+        Ok(())
+    }
+
     /// Return the filesystem path for a queue's shard database.
-    fn queue_db_path(&self, queue_id: &QueueId) -> PathBuf {
-        self.data_dir
+    /// Fails if the queue ID is not a safe filename component.
+    fn queue_db_path(&self, queue_id: &QueueId) -> Result<PathBuf, StorageError> {
+        Self::validate_queue_id_for_path(queue_id)?;
+        Ok(self
+            .data_dir
             .join("queues")
-            .join(format!("{}.db", queue_id.as_str()))
+            .join(format!("{}.db", queue_id.as_str())))
     }
 
     /// Get a shard for `queue_id`, opening it if necessary.
@@ -75,7 +98,7 @@ impl ShardedStorage {
             }
         }
         // Slow path: open on a blocking thread, then insert (first opener wins).
-        let path = self.queue_db_path(queue_id);
+        let path = self.queue_db_path(queue_id)?;
         let opened = tokio::task::spawn_blocking(move || SqliteStorage::open_queue(&path))
             .await
             .map_err(|e| StorageError::Internal(format!("open shard task panicked: {e}")))??;
@@ -248,6 +271,8 @@ impl Storage for ShardedStorage {
     // ---- Queue CRUD (catalog) ----
 
     async fn create_queue(&self, queue: &Queue) -> Result<(), StorageError> {
+        // Reject queue IDs that are unsafe as shard filenames before any write.
+        Self::validate_queue_id_for_path(&queue.id)?;
         // Insert queue metadata into catalog.
         self.catalog.create_queue(queue).await?;
         // Create the shard DB file (opens + initialises schema).
@@ -300,7 +325,7 @@ impl Storage for ShardedStorage {
         }
 
         // Delete the shard DB file (and WAL/SHM companions).
-        let base = self.queue_db_path(id);
+        let base = self.queue_db_path(id)?;
         for suffix in &["", "-wal", "-shm"] {
             let p = base.with_extension(format!("db{suffix}"));
             let _ = std::fs::remove_file(p);
@@ -318,9 +343,12 @@ impl Storage for ShardedStorage {
         deps: &HashMap<TaskId, Vec<TaskId>>,
     ) -> Result<(), StorageError> {
         let shard = self.get_or_open_shard(&flow.queue_id).await?;
-        shard.create_flow(flow, tasks, deps).await?;
 
-        // Register the flow → queue mapping in the catalog.
+        // Register the flow → queue mapping in the catalog FIRST, then write
+        // the flow to the shard. A crash between the two steps leaves a stale
+        // catalog entry (resolvable: lookups return FlowNotFound and the entry
+        // is cleaned up lazily), whereas the reverse order would strand a
+        // committed flow that no lookup could ever resolve.
         let fid = flow.id.as_str().to_owned();
         let qid = flow.queue_id.as_str().to_owned();
         let parent = flow.parent_flow_id.as_ref().map(|id| id.as_str().to_owned());
@@ -333,6 +361,20 @@ impl Storage for ShardedStorage {
                 Ok(())
             })
             .await?;
+
+        if let Err(e) = shard.create_flow(flow, tasks, deps).await {
+            // Best-effort rollback of the catalog mapping so the failed flow
+            // does not linger in the routing table.
+            let fid = flow.id.as_str().to_owned();
+            let _ = self
+                .catalog
+                .with_conn(move |conn| {
+                    conn.execute("DELETE FROM flow_map WHERE flow_id = ?1", params![fid])?;
+                    Ok(())
+                })
+                .await;
+            return Err(e);
+        }
 
         // Populate in-memory cache.
         self.flow_cache
@@ -468,10 +510,18 @@ impl Storage for ShardedStorage {
         if tasks.is_empty() {
             return Ok(vec![]);
         }
-        // All tasks in a dispatch batch share the same queue — resolve from the first flow_id.
-        let queue_id = self.resolve_flow_queue(tasks[0].1).await?;
-        let shard = self.get_or_open_shard(&queue_id).await?;
-        shard.mark_tasks_running_batch(tasks).await
+        // Entries may span queues: group by resolved queue and execute per shard.
+        let mut groups: HashMap<QueueId, Vec<(&TaskId, &FlowId)>> = HashMap::new();
+        for &(task_id, flow_id) in tasks {
+            let queue_id = self.resolve_flow_queue(flow_id).await?;
+            groups.entry(queue_id).or_default().push((task_id, flow_id));
+        }
+        let mut succeeded = Vec::with_capacity(tasks.len());
+        for (queue_id, group) in groups {
+            let shard = self.get_or_open_shard(&queue_id).await?;
+            succeeded.extend(shard.mark_tasks_running_batch(&group).await?);
+        }
+        Ok(succeeded)
     }
 
     async fn set_task_output(
@@ -585,11 +635,23 @@ impl Storage for ShardedStorage {
         if completions.is_empty() {
             return Ok(vec![]);
         }
-        // All completions in a process_completions_batch call are from the same queue,
-        // so resolve the shard from the first entry and delegate the entire batch.
-        let queue_id = self.resolve_flow_queue(&completions[0].1).await?;
-        let shard = self.get_or_open_shard(&queue_id).await?;
-        shard.complete_tasks_with_ready_batch(completions).await
+        // Entries may span queues: group by resolved queue, execute per shard,
+        // and stitch the per-shard results back into input order.
+        let mut groups: HashMap<QueueId, Vec<usize>> = HashMap::new();
+        for (i, (_, flow_id, _, _)) in completions.iter().enumerate() {
+            let queue_id = self.resolve_flow_queue(flow_id).await?;
+            groups.entry(queue_id).or_default().push(i);
+        }
+        let mut results: Vec<Option<Flow>> = vec![None; completions.len()];
+        for (queue_id, indices) in groups {
+            let shard = self.get_or_open_shard(&queue_id).await?;
+            let subset: Vec<_> = indices.iter().map(|&i| completions[i].clone()).collect();
+            let sub_results = shard.complete_tasks_with_ready_batch(&subset).await?;
+            for (slot, result) in indices.into_iter().zip(sub_results) {
+                results[slot] = result;
+            }
+        }
+        Ok(results)
     }
 
     async fn inject_tasks(

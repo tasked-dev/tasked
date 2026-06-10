@@ -373,7 +373,8 @@ fn apply_event(state: &mut MemState, event: JournalEvent) {
             state.queues.insert(queue.id.clone(), queue);
         }
         JournalEvent::QueueDeleted { queue_id } => {
-            state.queues.remove(&queue_id);
+            // Cascade exactly like the live delete_queue path.
+            state.remove_queue_cascade(&queue_id);
         }
         JournalEvent::FlowCreated { flow, tasks, deps } => {
             let flow_id = flow.id.clone();

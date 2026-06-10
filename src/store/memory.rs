@@ -66,6 +66,19 @@ impl Storage for MemoryStorage {
     async fn delete_queue(&self, id: &QueueId) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.queues.remove(id);
+        // Cascade: delete the queue's flows, tasks, deps, and schedules
+        // (matches the SQLite backend's FK ON DELETE CASCADE behavior).
+        let flow_ids: std::collections::HashSet<FlowId> = inner
+            .flows
+            .values()
+            .filter(|f| f.queue_id == *id)
+            .map(|f| f.id.clone())
+            .collect();
+        inner.flows.retain(|_, f| f.queue_id != *id);
+        inner.tasks.retain(|_, t| t.queue_id != *id);
+        inner.deps.retain(|(_, fid), _| !flow_ids.contains(fid));
+        inner.dependents.retain(|(_, fid), _| !flow_ids.contains(fid));
+        inner.schedules.retain(|_, s| s.queue_id != *id);
         Ok(())
     }
 
@@ -76,6 +89,15 @@ impl Storage for MemoryStorage {
         deps: &HashMap<TaskId, Vec<TaskId>>,
     ) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !inner.queues.contains_key(&flow.queue_id) {
+            return Err(StorageError::QueueNotFound(flow.queue_id.to_string()));
+        }
+        if inner.flows.contains_key(&flow.id) {
+            return Err(StorageError::Internal(format!(
+                "flow '{}' already exists",
+                flow.id
+            )));
+        }
         inner.flows.insert(flow.id.clone(), flow.clone());
 
         for task in tasks {
