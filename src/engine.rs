@@ -1337,6 +1337,86 @@ impl Engine {
             .remove(flow_id);
     }
 
+    /// Drop all per-flow engine caches once a flow reaches a terminal state.
+    fn evict_flow_caches(&self, flow_id: &FlowId) {
+        self.evict_dep_graph(flow_id);
+        self.trigger_depth_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(flow_id);
+    }
+
+    /// If every task in the flow has reached a terminal state, transition the
+    /// flow to `Succeeded`/`Failed` and run all end-of-flow side effects:
+    /// metrics, stats, artifact cleanup, webhooks, queue deactivation, and
+    /// cache eviction.
+    ///
+    /// This must be called after **every** task completion (success, failure,
+    /// skip, spawn). A flow with a failed branch only becomes fully terminal
+    /// when its *last* still-running branch finishes — which may be a success —
+    /// so checking only at failure time leaves flows stuck in `Running`.
+    ///
+    /// `flow` must carry the counters from the most recent completion (as
+    /// returned by `increment_flow_counter` or the batch completion call).
+    /// Returns `true` if this call finalized the flow.
+    async fn finalize_flow_if_complete(&self, flow: &Flow) -> Result<bool, EngineError> {
+        if flow.state.is_terminal() {
+            return Ok(false);
+        }
+        let all_succeeded = flow.tasks_succeeded == flow.task_count;
+        let final_state = if all_succeeded {
+            FlowState::Succeeded
+        } else if flow.tasks_failed > 0 {
+            // Only flows that have failures pay for the full task scan.
+            let tasks = self.store.get_flow_tasks(&flow.id).await?;
+            if !tasks.iter().all(|t| t.state.is_terminal()) {
+                return Ok(false);
+            }
+            FlowState::Failed
+        } else {
+            return Ok(false);
+        };
+
+        self.store.update_flow_state(&flow.id, final_state).await?;
+
+        let status = if all_succeeded { "succeeded" } else { "failed" };
+        metrics::counter!(
+            "tasked_flows_completed_total",
+            "queue_id" => flow.queue_id.as_str().to_owned(),
+            "status" => status
+        )
+        .increment(1);
+        self.stats
+            .flows_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug!(flow_id = %flow.id, state = %final_state, "flow finalized");
+
+        if let Some(ref artifacts) = self.artifacts
+            && let Err(e) = artifacts.cleanup(&flow.id).await
+        {
+            warn!(flow_id = %flow.id, error = %e, "artifact cleanup failed");
+        }
+
+        if let Some(ref webhooks) = flow.webhooks {
+            let url = if all_succeeded {
+                webhooks.on_complete.as_ref()
+            } else {
+                webhooks.on_failure.as_ref()
+            };
+            if let Some(url) = url {
+                // Deliver the final state, not the stale pre-transition copy.
+                let mut final_flow = flow.clone();
+                final_flow.state = final_state;
+                final_flow.updated_at = Utc::now();
+                crate::webhook::fire(url, &final_flow);
+            }
+        }
+
+        self.deactivate_if_idle(&flow.queue_id).await?;
+        self.evict_flow_caches(&flow.id);
+        Ok(true)
+    }
+
     /// Drain the completion buffer and write pending success completions to storage.
     async fn process_completions_batch(&self) -> Result<(), EngineError> {
         // Swap out the buffer (brief Mutex hold)
@@ -1398,42 +1478,8 @@ impl Engine {
             )
             .increment(1);
 
-            // Check if flow is complete
-            if flow.tasks_succeeded == flow.task_count {
-                self.store
-                    .update_flow_state(&event.task.flow_id, FlowState::Succeeded)
-                    .await?;
-
-                metrics::counter!(
-                    "tasked_flows_completed_total",
-                    "queue_id" => event.task.queue_id.as_str().to_owned(),
-                    "status" => "succeeded"
-                )
-                .increment(1);
-
-                debug!(flow_id = %event.task.flow_id, "flow succeeded");
-                self.stats
-                    .flows_completed
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                // Cleanup artifacts
-                if let Some(ref artifacts) = self.artifacts
-                    && let Err(e) = artifacts.cleanup(&event.task.flow_id).await
-                {
-                    warn!(flow_id = %event.task.flow_id, error = %e, "artifact cleanup failed");
-                }
-
-                // Fire on_complete webhook if configured
-                if let Some(ref webhooks) = flow.webhooks
-                    && let Some(ref url) = webhooks.on_complete
-                {
-                    crate::webhook::fire(url, flow);
-                }
-
-                // Deactivate queue if no more running flows remain
-                self.deactivate_if_idle(&event.task.queue_id).await?;
-                self.evict_dep_graph(&event.task.flow_id);
-            }
+            // Check if flow is complete (all-succeeded, or failed-branch fully terminal)
+            self.finalize_flow_if_complete(flow).await?;
         }
 
         crate::perf::counters::completion_total.record(t0);
@@ -1620,24 +1666,7 @@ impl Engine {
             .increment_flow_counter(&task.flow_id, succeeded)
             .await?;
 
-        if succeeded && flow.tasks_succeeded == flow.task_count {
-            self.store
-                .update_flow_state(&task.flow_id, FlowState::Succeeded)
-                .await?;
-            // Cleanup artifacts
-            if let Some(ref artifacts) = self.artifacts
-                && let Err(e) = artifacts.cleanup(&task.flow_id).await
-            {
-                warn!(flow_id = %task.flow_id, error = %e, "artifact cleanup failed");
-            }
-            if let Some(ref webhooks) = flow.webhooks
-                && let Some(ref url) = webhooks.on_complete
-            {
-                crate::webhook::fire(url, &flow);
-            }
-            self.deactivate_if_idle(&task.queue_id).await?;
-            self.evict_dep_graph(&task.flow_id);
-        } else if succeeded {
+        if succeeded && flow.tasks_succeeded < flow.task_count {
             // Promote newly-ready tasks using pre-resolved list or fall back to SQL
             if let Some(ready) = pre_resolved_ready {
                 for tid in &ready {
@@ -1648,39 +1677,8 @@ impl Engine {
             } else {
                 self.store.resolve_ready_tasks(&task.flow_id).await?;
             }
-        } else {
-            // Failed condition: check if all tasks are terminal
-            let tasks = self.store.get_flow_tasks(&task.flow_id).await?;
-            let all_terminal = tasks.iter().all(|t| t.state.is_terminal());
-            if all_terminal {
-                self.store
-                    .update_flow_state(&flow.id, FlowState::Failed)
-                    .await?;
-
-                metrics::counter!(
-                    "tasked_flows_completed_total",
-                    "queue_id" => task.queue_id.as_str().to_owned(),
-                    "status" => "failed"
-                )
-                .increment(1);
-
-                // Cleanup artifacts
-                if let Some(ref artifacts) = self.artifacts
-                    && let Err(e) = artifacts.cleanup(&task.flow_id).await
-                {
-                    warn!(flow_id = %task.flow_id, error = %e, "artifact cleanup failed");
-                }
-
-                if let Some(ref webhooks) = flow.webhooks
-                    && let Some(ref url) = webhooks.on_failure
-                {
-                    crate::webhook::fire(url, &flow);
-                }
-
-                self.deactivate_if_idle(&task.queue_id).await?;
-                self.evict_dep_graph(&task.flow_id);
-            }
         }
+        self.finalize_flow_if_complete(&flow).await?;
         Ok(())
     }
 
@@ -2060,42 +2058,8 @@ impl Engine {
                     debug!(task_id = %tid, flow_id = %task.flow_id, "task promoted to ready");
                 }
 
-                // Check if flow is complete
-                if flow.tasks_succeeded == flow.task_count {
-                    self.store
-                        .update_flow_state(&task.flow_id, FlowState::Succeeded)
-                        .await?;
-
-                    metrics::counter!(
-                        "tasked_flows_completed_total",
-                        "queue_id" => task.queue_id.as_str().to_owned(),
-                        "status" => "succeeded"
-                    )
-                    .increment(1);
-
-                    debug!(flow_id = %task.flow_id, "flow succeeded");
-                    self.stats
-                        .flows_completed
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                    // Cleanup artifacts
-                    if let Some(ref artifacts) = self.artifacts
-                        && let Err(e) = artifacts.cleanup(&task.flow_id).await
-                    {
-                        warn!(flow_id = %task.flow_id, error = %e, "artifact cleanup failed");
-                    }
-
-                    // Fire on_complete webhook if configured
-                    if let Some(ref webhooks) = flow.webhooks
-                        && let Some(ref url) = webhooks.on_complete
-                    {
-                        crate::webhook::fire(url, &flow);
-                    }
-
-                    // Deactivate queue if no more running flows remain
-                    self.deactivate_if_idle(&task.queue_id).await?;
-                    self.evict_dep_graph(&task.flow_id);
-                }
+                // Check if flow is complete (all-succeeded, or failed-branch fully terminal)
+                self.finalize_flow_if_complete(&flow).await?;
                 crate::perf::counters::completion_total.record(completion_start);
             }
             ExecuteResult::Failed { error, retryable } => {
@@ -2212,44 +2176,10 @@ impl Engine {
                         .increment_flow_counter(&task.flow_id, false)
                         .await?;
 
-                    // Check if all non-cancelled tasks are terminal
-                    let tasks = self.store.get_flow_tasks(&task.flow_id).await?;
-                    let all_terminal = tasks.iter().all(|t| t.state.is_terminal());
-                    if all_terminal {
-                        self.store
-                            .update_flow_state(&flow.id, FlowState::Failed)
-                            .await?;
-
-                        metrics::counter!(
-                            "tasked_flows_completed_total",
-                            "queue_id" => task.queue_id.as_str().to_owned(),
-                            "status" => "failed"
-                        )
-                        .increment(1);
-
-                        debug!(flow_id = %task.flow_id, "flow failed");
-                        self.stats
-                            .flows_completed
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                        // Cleanup artifacts
-                        if let Some(ref artifacts) = self.artifacts
-                            && let Err(e) = artifacts.cleanup(&task.flow_id).await
-                        {
-                            warn!(flow_id = %task.flow_id, error = %e, "artifact cleanup failed");
-                        }
-
-                        // Fire on_failure webhook if configured
-                        if let Some(ref webhooks) = flow.webhooks
-                            && let Some(ref url) = webhooks.on_failure
-                        {
-                            crate::webhook::fire(url, &flow);
-                        }
-
-                        // Deactivate queue if no more running flows remain
-                        self.deactivate_if_idle(&task.queue_id).await?;
-                        self.evict_dep_graph(&task.flow_id);
-                    }
+                    // The flow may now be fully terminal — or other branches may
+                    // still be running, in which case finalize re-checks when
+                    // each of them completes.
+                    self.finalize_flow_if_complete(&flow).await?;
                 }
             }
             ExecuteResult::AwaitingApproval { output } => {
@@ -2302,35 +2232,7 @@ impl Engine {
                         }
 
                         // Check if flow actually completed (unlikely right after injection)
-                        if flow.tasks_succeeded == flow.task_count {
-                            self.store
-                                .update_flow_state(&task.flow_id, FlowState::Succeeded)
-                                .await?;
-
-                            metrics::counter!(
-                                "tasked_flows_completed_total",
-                                "queue_id" => task.queue_id.as_str().to_owned(),
-                                "status" => "succeeded"
-                            )
-                            .increment(1);
-
-                            // Cleanup artifacts
-                            if let Some(ref artifacts) = self.artifacts
-                                && let Err(e) = artifacts.cleanup(&task.flow_id).await
-                            {
-                                warn!(flow_id = %task.flow_id, error = %e, "artifact cleanup failed");
-                            }
-
-                            if let Some(ref webhooks) = flow.webhooks
-                                && let Some(ref url) = webhooks.on_complete
-                            {
-                                crate::webhook::fire(url, &flow);
-                            }
-
-                            // Deactivate queue if no more running flows remain
-                            self.deactivate_if_idle(&task.queue_id).await?;
-                            self.evict_dep_graph(&task.flow_id);
-                        }
+                        self.finalize_flow_if_complete(&flow).await?;
                     }
                     Err(e) => {
                         // Injection failed -- fail the generator task
@@ -2388,37 +2290,7 @@ impl Engine {
                             .increment_flow_counter(&task.flow_id, false)
                             .await?;
 
-                        let tasks = self.store.get_flow_tasks(&task.flow_id).await?;
-                        let all_terminal = tasks.iter().all(|t| t.state.is_terminal());
-                        if all_terminal {
-                            self.store
-                                .update_flow_state(&flow.id, FlowState::Failed)
-                                .await?;
-
-                            metrics::counter!(
-                                "tasked_flows_completed_total",
-                                "queue_id" => task.queue_id.as_str().to_owned(),
-                                "status" => "failed"
-                            )
-                            .increment(1);
-
-                            // Cleanup artifacts
-                            if let Some(ref artifacts) = self.artifacts
-                                && let Err(e) = artifacts.cleanup(&task.flow_id).await
-                            {
-                                warn!(flow_id = %task.flow_id, error = %e, "artifact cleanup failed");
-                            }
-
-                            if let Some(ref webhooks) = flow.webhooks
-                                && let Some(ref url) = webhooks.on_failure
-                            {
-                                crate::webhook::fire(url, &flow);
-                            }
-
-                            // Deactivate queue if no more running flows remain
-                            self.deactivate_if_idle(&task.queue_id).await?;
-                            self.evict_dep_graph(&task.flow_id);
-                        }
+                        self.finalize_flow_if_complete(&flow).await?;
                     }
                 }
             }
