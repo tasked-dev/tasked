@@ -116,6 +116,66 @@ async fn all_tasks_succeed_finalizes_flow_as_succeeded() {
     assert_eq!(done.state, FlowState::Succeeded);
 }
 
+/// Regression (issue #4): driving the engine with the public process_cycle
+/// must persist completions and finish flows. Completions used to be flushed
+/// only by run()'s queue workers, so process_cycle executed tasks whose
+/// successes were never written — dependents never became ready.
+#[tokio::test]
+async fn process_cycle_persists_completions_and_finishes_flows() {
+    let engine = Arc::new(
+        Engine::builder(Arc::new(MemoryStorage::new()))
+            .executor("test", Arc::new(CallbackExecutor::always_succeed()))
+            .build(),
+    );
+    let queue_id = QueueId::from("q");
+    engine
+        .create_queue(&queue_id, QueueConfig::default())
+        .await
+        .unwrap();
+    // a -> b dependency chain: b only runs if a's success is persisted.
+    let flow = engine
+        .submit_flow(
+            &queue_id,
+            FlowDef {
+                tasks: vec![
+                    TaskDef {
+                        id: TaskId::from("a"),
+                        executor: "test".into(),
+                        ..Default::default()
+                    },
+                    TaskDef {
+                        id: TaskId::from("b"),
+                        executor: "test".into(),
+                        depends_on: vec![TaskId::from("a")],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        engine.process_cycle().await.unwrap();
+        if engine
+            .get_flow(&flow.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            .is_terminal()
+        {
+            break;
+        }
+        // Dispatched executors run as spawned tasks; give them a beat to finish.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let done = engine.get_flow(&flow.id).await.unwrap().unwrap();
+    assert_eq!(done.state, FlowState::Succeeded);
+}
+
 /// End-to-end via process_cycle_sync: one branch fails, the other succeeds —
 /// regardless of dispatch order, the flow must reach Failed.
 #[tokio::test]

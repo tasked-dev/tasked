@@ -178,6 +178,19 @@ impl FlowDepGraph {
         newly_ready
     }
 
+    /// Roll back [`Self::on_task_succeeded`] for a task whose completion was
+    /// skipped by storage (e.g. it was cancelled between dispatch and the
+    /// batch write), keeping the in-memory counts consistent with storage.
+    fn undo_task_succeeded(&mut self, task_id: &TaskId) {
+        if let Some(deps) = self.dependents.get(task_id) {
+            for dep_id in deps {
+                if let Some(count) = self.unsatisfied.get_mut(dep_id) {
+                    *count += 1;
+                }
+            }
+        }
+    }
+
     /// Inject new tasks from a spawn executor. Accounts for already-succeeded deps.
     fn inject(
         &mut self,
@@ -293,8 +306,10 @@ pub struct Engine {
     delayed_task_count: std::sync::atomic::AtomicUsize,
     /// In-memory dependency graphs per flow for O(degree) dep resolution.
     dep_graphs: std::sync::Mutex<HashMap<FlowId, FlowDepGraph>>,
-    /// Buffer for completed task results pending batch write to storage.
-    completion_buffer: std::sync::Mutex<Vec<CompletionEvent>>,
+    /// Per-queue buffers of completed task results pending batch write to
+    /// storage. Keyed by queue so each queue worker only flushes its own
+    /// completions — sharded storage requires single-queue batches.
+    completion_buffer: std::sync::Mutex<HashMap<QueueId, Vec<CompletionEvent>>>,
     /// Per-queue wake signals. Workers block on their queue's Notify.
     queue_notifiers: std::sync::Mutex<HashMap<QueueId, Arc<Notify>>>,
     /// Handles for active queue workers (for cleanup on queue deletion).
@@ -392,7 +407,7 @@ impl EngineBuilder {
             queue_config_cache: std::sync::Mutex::new(HashMap::new()),
             delayed_task_count: std::sync::atomic::AtomicUsize::new(0),
             dep_graphs: std::sync::Mutex::new(HashMap::new()),
-            completion_buffer: std::sync::Mutex::new(Vec::new()),
+            completion_buffer: std::sync::Mutex::new(HashMap::new()),
             queue_notifiers: std::sync::Mutex::new(HashMap::new()),
             queue_workers: std::sync::Mutex::new(HashMap::new()),
             stats: EngineStats::new(),
@@ -421,7 +436,7 @@ impl Engine {
             queue_config_cache: std::sync::Mutex::new(HashMap::new()),
             delayed_task_count: std::sync::atomic::AtomicUsize::new(0),
             dep_graphs: std::sync::Mutex::new(HashMap::new()),
-            completion_buffer: std::sync::Mutex::new(Vec::new()),
+            completion_buffer: std::sync::Mutex::new(HashMap::new()),
             queue_notifiers: std::sync::Mutex::new(HashMap::new()),
             queue_workers: std::sync::Mutex::new(HashMap::new()),
             stats: EngineStats::new(),
@@ -1134,7 +1149,12 @@ impl Engine {
     pub async fn process_cycle(self: &Arc<Self>) -> Result<(), EngineError> {
         metrics::counter!("tasked_engine_cycles_total").increment(1);
 
-        // 1. Promote delayed tasks
+        // 1. Flush completions buffered by tasks dispatched in earlier cycles.
+        // Without this, callers driving the engine via process_cycle (rather
+        // than run()) would execute tasks whose successes are never persisted.
+        self.flush_all_completions().await?;
+
+        // 2. Promote delayed tasks
         let t0 = std::time::Instant::now();
         self.promote_delayed_tasks().await?;
         crate::perf::counters::promote_delayed.record(t0);
@@ -1417,15 +1437,48 @@ impl Engine {
         Ok(true)
     }
 
-    /// Drain the completion buffer and write pending success completions to storage.
-    async fn process_completions_batch(&self) -> Result<(), EngineError> {
-        // Swap out the buffer (brief Mutex hold)
-        let events: Vec<CompletionEvent> = {
+    /// Buffer a successful completion for batch write by the queue's worker.
+    fn buffer_completion(&self, event: CompletionEvent) {
+        self.completion_buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(event.task.queue_id.clone())
+            .or_default()
+            .push(event);
+    }
+
+    /// Drain and persist buffered completions for every queue.
+    /// Used by [`Engine::process_cycle`]; queue workers flush only their own
+    /// queue via [`Engine::process_completions_batch`].
+    async fn flush_all_completions(&self) -> Result<(), EngineError> {
+        let queue_ids: Vec<QueueId> = {
+            self.completion_buffer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned()
+                .collect()
+        };
+        for qid in &queue_ids {
+            self.process_completions_batch(qid).await?;
+        }
+        Ok(())
+    }
+
+    /// Drain this queue's completion buffer and write pending success
+    /// completions to storage in one batch.
+    ///
+    /// Batches are strictly per-queue: sharded storage resolves the target
+    /// shard from the first entry, so mixing queues would write completions
+    /// to the wrong shard.
+    async fn process_completions_batch(&self, queue_id: &QueueId) -> Result<(), EngineError> {
+        // Swap out this queue's buffer (brief Mutex hold)
+        let mut events: Vec<CompletionEvent> = {
             let mut buf = self
                 .completion_buffer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *buf)
+            buf.remove(queue_id).unwrap_or_default()
         };
 
         if events.is_empty() {
@@ -1435,10 +1488,19 @@ impl Engine {
         let t0 = std::time::Instant::now();
         let batch_count = events.len();
 
-        // Build batch from events. Use pre-resolved newly_ready if available
-        // (from in-memory dep graph), otherwise pass empty and let storage
-        // resolve deps via SQL. This avoids ensure_dep_graph overhead (2 DB
-        // queries per uncached flow) which dominated batch time under backlog.
+        // Events carry pre-resolved newly_ready when the flow's dep graph was
+        // cached at completion time. For the rest (e.g. flows recovered from
+        // disk), build the graph and resolve here — the default storage
+        // implementation promotes exactly the IDs we pass, so an empty list
+        // would strand dependents forever on non-SQLite backends.
+        for event in &mut events {
+            if event.newly_ready.is_none() {
+                self.ensure_dep_graph(&event.task.flow_id).await;
+                event.newly_ready =
+                    self.resolve_deps_in_memory(&event.task.flow_id, &event.task.id);
+            }
+        }
+
         let batch: Vec<(TaskId, FlowId, Option<serde_json::Value>, Vec<TaskId>)> = events
             .iter()
             .map(|e| {
@@ -1467,7 +1529,14 @@ impl Engine {
         // Process results (metrics, flow completion, webhooks)
         for (event, result) in events.iter().zip(results.iter()) {
             let Some(flow) = result else {
-                // Task was cancelled/already succeeded — skip
+                // Task was cancelled/already succeeded — storage skipped it,
+                // so roll back the in-memory dep-graph decrement.
+                if event.newly_ready.is_some() {
+                    let mut graphs = self.dep_graphs.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(graph) = graphs.get_mut(&event.task.flow_id) {
+                        graph.undo_task_succeeded(&event.task.id);
+                    }
+                }
                 continue;
             };
 
@@ -1862,23 +1931,20 @@ impl Engine {
                 let task_queue_id = task.queue_id.clone();
                 match result {
                     ExecuteResult::Success { output } => {
-                        // Batch success completions: resolve deps in-memory, buffer for batch write.
-                        // Dep graph is ensured in process_completions_batch (not here) to avoid
-                        // concurrent Mutex contention from spawned tasks.
+                        // Batch success completions: resolve deps in-memory (when the
+                        // flow's graph is cached) and buffer for batch write. Flows
+                        // without a cached graph get resolved at flush time in
+                        // process_completions_batch.
                         let newly_ready = engine.resolve_deps_in_memory(&task.flow_id, &task.id);
                         engine
                             .stats
                             .tasks_completed
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        engine
-                            .completion_buffer
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(CompletionEvent {
-                                task,
-                                output,
-                                newly_ready,
-                            });
+                        engine.buffer_completion(CompletionEvent {
+                            task,
+                            output,
+                            newly_ready,
+                        });
                     }
                     other => {
                         // Non-success results handled directly (rare path)
@@ -2843,7 +2909,7 @@ async fn queue_worker_loop(engine: Arc<Engine>, queue_id: QueueId, notify: Arc<N
 
         // Process any buffered completions first — this flushes results from
         // previously dispatched tasks, which may promote new tasks to Ready.
-        if let Err(e) = engine.process_completions_batch().await {
+        if let Err(e) = engine.process_completions_batch(&queue_id).await {
             error!(queue_id = %queue_id, error = %e, "completion batch failed");
         }
 
